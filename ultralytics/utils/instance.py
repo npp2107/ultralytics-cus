@@ -399,13 +399,16 @@ class Instances:
             self.keypoints[..., 0] = self.keypoints[..., 0].clip(0, w)
             self.keypoints[..., 1] = self.keypoints[..., 1].clip(0, h)
 
-    def remove_zero_area_boxes(self) -> np.ndarray:
+    def remove_zero_area_boxes(self, min_area: float = 0.0) -> np.ndarray:
         """Remove zero-area boxes, i.e. after clipping some boxes may have zero width or height.
+
+        Args:
+            min_area (float): Optional explicitly provided box area threshold to keep.
 
         Returns:
             (np.ndarray): Boolean array indicating which boxes were kept.
         """
-        good = self.bbox_areas > 0
+        good = self.bbox_areas > min_area
         if not all(good):
             self._bboxes = self._bboxes[good]
             if self.segments is not None and len(self.segments):

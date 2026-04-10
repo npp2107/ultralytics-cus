@@ -85,6 +85,10 @@ class BaseDataset(Dataset):
         classes: list[int] | None = None,
         fraction: float = 1.0,
         channels: int = 3,
+        save_training_imgs: bool = False,
+        save_val: bool = False,
+        save_dir_img: str = None,
+        save_dir_lbl: str = None
     ):
         """Initialize BaseDataset with given configuration and options.
 
@@ -106,6 +110,10 @@ class BaseDataset(Dataset):
                 OpenCV are in BGR channel order.
         """
         super().__init__()
+        self.save_training_imgs = save_training_imgs
+        self.save_val = save_val
+        self.save_dir_img = save_dir_img
+        self.save_dir_lbl = save_dir_lbl
         self.img_path = img_path
         self.imgsz = imgsz
         self.augment = augment
@@ -377,7 +385,68 @@ class BaseDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return transformed label information for given index."""
-        return self.transforms(self.get_image_and_label(index))
+        import uuid
+        import os
+        import cv2
+        import numpy as np
+        if not self.save_training_imgs:
+            return self.transforms(self.get_image_and_label(index))
+        else:
+            data = self.transforms(self.get_image_and_label(index))
+
+            # Nếu save_val=False và tên file chứa "val", thì không lưu
+            im_file = data.get("im_file", "aug.jpg")
+            if not self.save_val and "val" in im_file.lower():
+                return data  # không lưu, chỉ trả về data
+
+            # ================== LƯU ẢNH + LABEL SAU AUGMENT ==================
+            save_dir_img = self.save_dir_img
+            save_dir_lbl = self.save_dir_lbl
+            os.makedirs(save_dir_img, exist_ok=True)
+            os.makedirs(save_dir_lbl, exist_ok=True)
+
+            # ---- Lấy ảnh ----
+            img = data["img"]  # Tensor CHW float32 (0-1)
+            if hasattr(img, "cpu"):  # tensor -> numpy
+                img = img.cpu().numpy()
+
+            # CHW -> HWC
+            if img.shape[0] in (1, 3):
+                img = img.transpose(1, 2, 0)
+
+            # scale về [0,255]
+            if img.max() <= 1.0:
+                img = (img * 255).astype(np.uint8)
+
+            # Lưu ảnh
+            unique_id = str(uuid.uuid4())[:8]
+            filename = os.path.splitext(os.path.basename(im_file))[0] 
+            filename = f"{filename}_{unique_id}"
+            img_path = os.path.join(save_dir_img, f"{filename}.jpg")
+            cv2.imwrite(img_path, img[..., ::-1])  # RGB -> BGR
+
+            # ---- Lấy label YOLO format ----
+            if "instances" in data and hasattr(data["instances"], "bboxes"):
+                bboxes = data["instances"].bboxes  # Có thể là tensor hoặc list
+                classes = data["instances"].cls
+            else:
+                bboxes = data.get("bboxes", [])
+                classes = data.get("cls", [])
+
+            # Ép kiểu về Numpy array và đảm bảo định dạng
+            bboxes = np.array(bboxes).reshape(-1, 4) 
+            classes = np.array(classes).flatten()
+
+            # Lưu label
+            label_path = os.path.join(save_dir_lbl, f"{filename}.txt")
+            with open(label_path, "w") as f:
+                for i in range(len(bboxes)):
+                    cls = classes[i]
+                    x, y, w, h = bboxes[i]
+                    # Sử dụng float(x) để chắc chắn nó là số thực đơn lẻ
+                    f.write(f"{int(cls)} {float(x):.6f} {float(y):.6f} {float(w):.6f} {float(h):.6f}\n")
+
+            return data
 
     def get_image_and_label(self, index: int) -> dict[str, Any]:
         """Get and return label information from the dataset.

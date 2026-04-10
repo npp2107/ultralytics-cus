@@ -324,7 +324,7 @@ class BaseMixTransform:
         >>> mixed_labels = transform(original_labels)
     """
 
-    def __init__(self, dataset, pre_transform=None, p=0.0) -> None:
+    def __init__(self, dataset, pre_transform=None, p=0.0, min_area: float = 0.0) -> None:
         """Initialize the BaseMixTransform object for mix transformations like CutMix, MixUp and Mosaic.
 
         This class serves as a base for implementing mix transformations in image processing pipelines.
@@ -337,6 +337,7 @@ class BaseMixTransform:
         self.dataset = dataset
         self.pre_transform = pre_transform
         self.p = p
+        self.min_area = min_area
 
     def __call__(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Apply pre-processing transforms and cutmix/mixup/mosaic transforms to labels data.
@@ -484,7 +485,7 @@ class Mosaic(BaseMixTransform):
         >>> augmented_labels = mosaic_aug(original_labels)
     """
 
-    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4):
+    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0, n: int = 4, min_area: float = 0.0):
         """Initialize the Mosaic augmentation object.
 
         This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image. The
@@ -498,7 +499,7 @@ class Mosaic(BaseMixTransform):
         """
         assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
         assert n in {4, 9}, "grid must be equal to 4 or 9."
-        super().__init__(dataset=dataset, p=p)
+        super().__init__(dataset=dataset, p=p, min_area=min_area)
         self.imgsz = imgsz
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
         self.n = n
@@ -808,7 +809,7 @@ class Mosaic(BaseMixTransform):
             "mosaic_border": self.border,
         }
         final_labels["instances"].clip(imgsz, imgsz)
-        good = final_labels["instances"].remove_zero_area_boxes()
+        good = final_labels["instances"].remove_zero_area_boxes(self.min_area)
         final_labels["cls"] = final_labels["cls"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
@@ -1029,6 +1030,7 @@ class RandomPerspective:
         perspective: float = 0.0,
         border: tuple[int, int] = (0, 0),
         pre_transform=None,
+        area_thr: float = 0.0,
     ):
         """Initialize RandomPerspective object with transformation parameters.
 
@@ -1052,6 +1054,7 @@ class RandomPerspective:
         self.perspective = perspective
         self.border = border  # mosaic border
         self.pre_transform = pre_transform
+        self.area_thr = area_thr
 
     def affine_transform(self, img: np.ndarray, border: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, float]:
         """Apply a sequence of affine transformations centered around the image center.
@@ -1291,7 +1294,8 @@ class RandomPerspective:
         instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
         # Make the bboxes have the same scale with new_bboxes
         i = self.box_candidates(
-            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else 0.10
+            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else self.area_thr
+            # box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.6
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
@@ -1798,7 +1802,7 @@ class Albumentations:
         - Some transforms are applied with very low probability (0.01) by default.
     """
 
-    def __init__(self, p: float = 1.0, transforms: list | None = None) -> None:
+    def __init__(self, p: float = 1.0, transforms: list | None = None, area_thr: float = 0.0, min_area: float = 0.0) -> None:
         """Initialize the Albumentations transform object for YOLO bbox formatted parameters.
 
         This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
@@ -1883,7 +1887,7 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], min_visibility=area_thr, min_area=min_area))
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -2411,7 +2415,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         >>> hyp.augmentations = augmentations
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
-    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic, min_area=hyp.min_area)
     affine = RandomPerspective(
         degrees=hyp.degrees,
         translate=hyp.translate,
@@ -2419,6 +2423,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         shear=hyp.shear,
         perspective=hyp.perspective,
         pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
+        area_thr=hyp.area_thr,
     )
 
     pre_transform = Compose([mosaic, affine])
@@ -2447,7 +2452,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
-            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None)),
+            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None), area_thr=hyp.area_thr, min_area=hyp.min_area),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),

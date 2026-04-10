@@ -249,6 +249,10 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=cfg.fraction if mode == "train" else 1.0,
+        save_training_imgs=cfg.save_training_imgs,
+        save_val=cfg.save_val,
+        save_dir_img=cfg.save_dir_img,
+        save_dir_lbl=cfg.save_dir_lbl,
     )
 
 
