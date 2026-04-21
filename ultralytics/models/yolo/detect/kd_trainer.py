@@ -8,57 +8,42 @@ Usage:
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 import subprocess
 import time
 import warnings
-from copy import copy, deepcopy
-from datetime import datetime, timedelta
+from datetime import timedelta
 from functools import partial
-from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
-from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
-from ultralytics.data.utils import check_cls_dataset, check_det_dataset
-from ultralytics.nn.tasks import load_checkpoint
 from ultralytics.optim import MuSGD
 from ultralytics.utils import (
     DEFAULT_CFG,
-    GIT,
     LOCAL_RANK,
     LOGGER,
     RANK,
     TQDM,
     YAML,
     callbacks,
-    clean_url,
     colorstr,
-    emojis,
 )
-from ultralytics.utils.autobatch import check_train_batch_size
 from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
-from ultralytics.utils.files import get_latest_run
-from ultralytics.utils.plotting import plot_results
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
     ModelEMA,
     attempt_compile,
     autocast,
-    convert_optimizer_state_dict_to_fp16,
     init_seeds,
     one_cycle,
     select_device,
-    strip_optimizer,
     torch_distributed_zero_first,
     unset_deterministic,
     unwrap_model,
@@ -133,7 +118,8 @@ class KD_Trainer(DetectionTrainer):
         self.validator = None
         self.metrics = None
         self.plots = {}
-        self.distill_loss_weight = self.args.distill_loss_weight
+        self.distill_loss_weight = overrides.get("distill_loss_weight", 0.0)
+        print("distill_loss_weight", self.distill_loss_weight)
         
         if overrides:
             self.teacher = overrides.get("teacher", None)
