@@ -118,8 +118,7 @@ class KD_Trainer(DetectionTrainer):
         self.validator = None
         self.metrics = None
         self.plots = {}
-        self.distill_loss_weight = overrides.get("distill_loss_weight", 0.0)
-        print("distill_loss_weight", self.distill_loss_weight)
+        self.distill_loss_weight = overrides.get("distill_loss_weight", 1.0)
         
         if overrides:
             self.teacher = overrides.get("teacher", None)
@@ -396,7 +395,7 @@ class KD_Trainer(DetectionTrainer):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
                 # make loss
         if self.teacher is not None:
-            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight)
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -461,7 +460,7 @@ class KD_Trainer(DetectionTrainer):
 
                     # Add more distillation logic
                     if self.teacher is not None:
-                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        distill_weight = self.distill_loss_weight * ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
                         with torch.no_grad():
                             pred = self.teacher(batch['img'])
                             
