@@ -48,7 +48,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-from ultralytics.utils.loss import DistillationLoss
+from ultralytics.utils.distill_loss import DistillationLoss
 from ultralytics.models.yolo.detect import DetectionTrainer
 
 class KD_Trainer(DetectionTrainer):
