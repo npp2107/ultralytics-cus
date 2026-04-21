@@ -163,7 +163,8 @@ class FeatureLoss(nn.Module):
 class DistillationLoss:
     def __init__(self, models, modelt, distiller="CWDLoss"):
         self.distiller = distiller
-        self.layers = ["6", "8", "13", "16", "19", "22"]
+        self.s_layers = ["6", "8", "13", "16", "19", "22"]
+        self.t_layers = ["6", "8", "13", "16", "19", "22"]
         self.models = models 
         self.modelt = modelt
 
@@ -203,7 +204,7 @@ class DistillationLoss:
                 if name[0] != "model":
                     continue
                 if len(name) >= 3:
-                    if name[1] in self.layers:
+                    if name[1] in self.t_layers:
                         if "cv2" in name[2]:
                             if hasattr(ml, 'conv'):
                                 self.channels_t.append(ml.conv.out_channels)
@@ -216,7 +217,7 @@ class DistillationLoss:
                 if name[0] != "model":
                     continue
                 if len(name) >= 3:
-                    if name[1] in self.layers:
+                    if name[1] in self.s_layers:
                         if "cv2" in name[2]:
                             if hasattr(ml, 'conv'):
                                 self.channels_s.append(ml.conv.out_channels)
