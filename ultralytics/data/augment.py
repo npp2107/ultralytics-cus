@@ -816,6 +816,295 @@ class Mosaic(BaseMixTransform):
         return final_labels
 
 
+class Concatenate(BaseMixTransform):
+    """Mosaic augmentation for image datasets.
+
+    This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image. The
+    augmentation is applied to a dataset with a given probability.
+
+    Attributes:
+        dataset: The dataset on which the mosaic augmentation is applied.
+        imgsz (int): Image size (height and width) after mosaic pipeline of a single image.
+        p (float): Probability of applying the mosaic augmentation. Must be in the range 0-1.
+
+    Methods:
+        get_indexes: Return a list of random indexes from the dataset.
+        _mix_transform: Apply mosaic transformation to the input image and labels.
+        _concatenate: Create a 2x2 image mosaic.
+        _update_labels: Update labels with padding.
+        _cat_labels: Concatenate labels and clips mosaic border instances.
+
+    Examples:
+        >>> from ultralytics.data.augment import Mosaic
+        >>> dataset = YourDataset(...)  # Your image dataset
+        >>> mosaic_aug = Mosaic(dataset, imgsz=640, p=0.5, n=4)
+        >>> augmented_labels = mosaic_aug(original_labels)
+    """
+
+    def __init__(self, dataset, imgsz: int = 640, p: float = 1.0):
+        """Initialize the Mosaic augmentation object.
+
+        This class performs mosaic augmentation by combining multiple (4 or 9) images into a single mosaic image. The
+        augmentation is applied to a dataset with a given probability.
+
+        Args:
+            dataset (Any): The dataset on which the mosaic augmentation is applied.
+            imgsz (int): Image size (height and width) after mosaic pipeline of a single image.
+            p (float): Probability of applying the mosaic augmentation. Must be in the range 0-1.
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+        super().__init__(dataset=dataset, p=p, min_area=0.0)
+        self.imgsz = imgsz
+        self.buffer_enabled = self.dataset.cache != "ram"
+
+    def get_indexes(self):
+        """Return a list of random indexes from the dataset for mosaic augmentation.
+
+        This method selects random image indexes either from a buffer or from the entire dataset, depending on the
+        'buffer_enabled' attribute. It is used to choose images for creating mosaic augmentations.
+
+        Returns:
+            (list[int]): A list of random image indexes. The length of the list is n-1, where n is the number of images
+                used in the mosaic (either 3 or 8, depending on whether n is 4 or 9).
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640, p=1.0, n=4)
+            >>> indexes = mosaic.get_indexes()
+            >>> print(len(indexes))  # Output: 3
+        """
+        return [random.randint(0, len(self.dataset) - 1) for _ in range(4 - 1)]
+
+    def _mix_transform(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Apply mosaic augmentation to the input image and labels.
+
+        This method combines multiple images (3, 4, or 9) into a single mosaic image based on the 'n' attribute. It
+        ensures that rectangular annotations are not present and that there are other images available for mosaic
+        augmentation.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and annotations. Expected keys include:
+                - 'rect_shape': Should be None as rect and mosaic are mutually exclusive.
+                - 'mix_labels': A list of dictionaries containing data for other images to be used in the mosaic.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the mosaic-augmented image and updated annotations.
+
+        Raises:
+            AssertionError: If 'rect_shape' is not None or if 'mix_labels' is empty.
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640, p=1.0, n=4)
+            >>> augmented_data = mosaic._mix_transform(labels)
+        """
+        assert labels.get("rect_shape") is None, "rect and mosaic are mutually exclusive."
+        assert len(labels.get("mix_labels", [])), "There are no other images for mosaic augment."
+        return (
+            self._concatenate(labels)
+        )  # This code is modified for mosaic3 method.
+
+    def _concatenate(self, labels: dict[str, Any]) -> dict[str, Any]:
+        """Create a 2x2 image mosaic from four input images using custom row/col scaling logic.
+        
+        Args:
+            labels (dict[str, Any]): A dictionary containing image data and labels for the base image (index 0) and
+                three additional images (indices 1-3) in the 'mix_labels' key.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing the mosaic image and updated labels.
+        """
+        if "KM20_LC_HN_Cao_toc_Noi_Bai_Lao_Cai_TOC_DO_231_15-13-01.200__29B14269__ve" in labels["im_file"] :
+            print("jasdjoiasdjoiasjoi")
+        import cv2 # Đảm bảo cv2 đã được import trong file
+        mosaic_labels = []
+        
+        # Lấy danh sách 4 ảnh (1 ảnh gốc + 3 ảnh mix)
+        patches = [labels] + labels.get("mix_labels", [])
+        if len(patches) < 4:
+            raise ValueError("Mosaic4 requires exactly 4 images.")
+            
+        cols = 2
+        rows = []
+        row_metadata = []
+        
+        # 1. Build rows (Tạo từng hàng, mỗi hàng 2 ảnh)
+        for row_start in range(0, 4, cols):
+            row_items = patches[row_start:row_start + cols]
+            
+            # Tìm chiều cao lớn nhất trong hàng để làm chuẩn
+            target_h = max(patch["img"].shape[0] for patch in row_items)
+            
+            row_crops = []
+            current_x = 0
+            row_meta = []
+            
+            for patch in row_items:
+                # Xóa resized_shape cũ để tránh xung đột với pipeline gốc
+                if "resized_shape" in patch:
+                    patch.pop("resized_shape")
+                    
+                img = patch["img"]
+                h, w = img.shape[:2]
+                
+                # Scale ảnh thứ nhất (Scale 1: cho bằng chiều cao target_h)
+                if h != target_h:
+                    scale_1 = target_h / h
+                    new_w = int(w * scale_1)
+                    img_resized = cv2.resize(img, (new_w, target_h))
+                else:
+                    scale_1 = 1.0
+                    img_resized = img
+                    
+                # Lưu metadata để tính toán tọa độ box sau này
+                row_meta.append({
+                    'patch': patch,
+                    'scale_1': scale_1,
+                    'col_x_start': current_x
+                })
+                row_crops.append(img_resized)
+                current_x += img_resized.shape[1]
+                
+            # Nối các ảnh theo chiều ngang
+            row_img = cv2.hconcat(row_crops)
+            rows.append(row_img)
+            row_metadata.append(row_meta)
+            
+        # 2. Combine rows (Ghép các hàng lại với nhau)
+        # Tìm chiều rộng lớn nhất của các hàng để làm chuẩn
+        target_w = max(row_img.shape[1] for row_img in rows)
+        final_rows = []
+        current_y = 0
+        
+        for row_idx, row_img in enumerate(rows):
+            h, w = row_img.shape[:2]
+            
+            # Scale hàng (Scale 2: cho bằng chiều rộng target_w)
+            if w != target_w:
+                scale_2 = target_w / w
+                new_h = int(h * scale_2)
+                row_resized = cv2.resize(row_img, (target_w, new_h))
+            else:
+                scale_2 = 1.0
+                row_resized = row_img
+                
+            final_rows.append(row_resized)
+            
+            # Cập nhật Tọa độ / Labels cho từng ảnh trong hàng hiện tại
+            for meta in row_metadata[row_idx]:
+                patch = meta['patch']
+                scale_1 = meta['scale_1']
+                col_x_start = meta['col_x_start']
+                
+                # Tổng hợp scale và tọa độ dịch chuyển
+                total_scale = scale_1 * scale_2
+                padw = col_x_start * scale_2
+                padh = current_y
+                
+                # Cập nhật scale cho bounding boxes/segments bằng API của Ultralytics
+                if "instances" in patch:
+                    patch["instances"].scale(scale_w=total_scale, scale_h=total_scale)
+                
+                # Cập nhật translation (dịch chuyển box về vị trí mới trong lưới ghép)
+                patch = self._update_labels(patch, padw, padh)
+                mosaic_labels.append(patch)
+                
+            current_y += row_resized.shape[0]
+            
+        # Nối các hàng theo chiều dọc
+        final_img = cv2.vconcat(final_rows)
+        
+        # Gộp tất cả labels của 4 ảnh thành 1 mảng chung
+        final_labels = self._cat_labels(mosaic_labels)
+        
+        # 3. Final Resize (Quan trọng)
+        # Pipeline của Ultralytics (các bước augment phía sau như RandomPerspective)
+        # thường kỳ vọng kết quả của Mosaic có kích thước đúng bằng (imgsz * 2, imgsz * 2).
+        # Ảnh tự ghép của bạn sẽ ra tỷ lệ tự do, nên cần resize lần cuối về kích thước chuẩn của YOLO.
+        s = self.imgsz
+        fh, fw = final_img.shape[:2]
+        if fh != s or fw != s:
+            final_img = cv2.resize(final_img, (s, s))
+            if "instances" in final_labels:
+                # Scale các box theo tỷ lệ vừa resize ép kiểu
+                final_labels["instances"].scale(scale_w=s/fw, scale_h=s/fh)
+                
+        final_labels["img"] = final_img
+        return final_labels
+
+    @staticmethod
+    def _update_labels(labels, padw: int, padh: int) -> dict[str, Any]:
+        """Update label coordinates with padding values.
+
+        This method adjusts the bounding box coordinates of object instances in the labels by adding padding
+        values. It also denormalizes the coordinates if they were previously normalized.
+
+        Args:
+            labels (dict[str, Any]): A dictionary containing image and instance information.
+            padw (int): Padding width to be added to the x-coordinates.
+            padh (int): Padding height to be added to the y-coordinates.
+
+        Returns:
+            (dict): Updated labels dictionary with adjusted instance coordinates.
+
+        Examples:
+            >>> labels = {"img": np.zeros((100, 100, 3)), "instances": Instances(...)}
+            >>> padw, padh = 50, 50
+            >>> updated_labels = Mosaic._update_labels(labels, padw, padh)
+        """
+        nh, nw = labels["img"].shape[:2]
+        labels["instances"].convert_bbox(format="xyxy")
+        labels["instances"].denormalize(nw, nh)
+        labels["instances"].add_padding(padw, padh)
+        return labels
+
+    def _cat_labels(self, mosaic_labels: list[dict[str, Any]]) -> dict[str, Any]:
+        """Concatenate and process labels for mosaic augmentation.
+
+        This method combines labels from multiple images used in mosaic augmentation, clips instances to the mosaic
+        border, and removes zero-area boxes.
+
+        Args:
+            mosaic_labels (list[dict[str, Any]]): A list of label dictionaries for each image in the mosaic.
+
+        Returns:
+            (dict[str, Any]): A dictionary containing concatenated and processed labels for the mosaic image, including:
+                - im_file (str): File path of the first image in the mosaic.
+                - ori_shape (tuple[int, int]): Original shape of the first image.
+                - resized_shape (tuple[int, int]): Shape of the mosaic image (imgsz * 2, imgsz * 2).
+                - cls (np.ndarray): Concatenated class labels.
+                - instances (Instances): Concatenated instance annotations.
+                - mosaic_border (tuple[int, int]): Mosaic border size.
+                - texts (list[str], optional): Text labels if present in the original labels.
+
+        Examples:
+            >>> mosaic = Mosaic(dataset, imgsz=640)
+            >>> mosaic_labels = [{"cls": np.array([0, 1]), "instances": Instances(...)} for _ in range(4)]
+            >>> result = mosaic._cat_labels(mosaic_labels)
+            >>> print(result.keys())
+            dict_keys(['im_file', 'ori_shape', 'resized_shape', 'cls', 'instances', 'mosaic_border'])
+        """
+        if not mosaic_labels:
+            return {}
+        cls = []
+        instances = []
+        imgsz = self.imgsz # mosaic imgsz
+        for labels in mosaic_labels:
+            cls.append(labels["cls"])
+            instances.append(labels["instances"])
+        # Final labels
+        final_labels = {
+            "im_file": mosaic_labels[0]["im_file"],
+            "ori_shape": mosaic_labels[0]["ori_shape"],
+            "resized_shape": (imgsz, imgsz),
+            "cls": np.concatenate(cls, 0),
+            "instances": Instances.concatenate(instances, axis=0),
+        }
+        # final_labels["instances"].clip(imgsz, imgsz)
+        # good = final_labels["instances"].remove_zero_area_boxes(self.min_area)
+        # final_labels["cls"] = final_labels["cls"][good]
+        if "texts" in mosaic_labels[0]:
+            final_labels["texts"] = mosaic_labels[0]["texts"]
+        return final_labels
+
 class MixUp(BaseMixTransform):
     """Apply MixUp augmentation to image datasets.
 
@@ -1887,7 +2176,10 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], min_visibility=area_thr, min_area=min_area))
+                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], 
+                min_visibility=area_thr,
+                min_area=min_area
+                ))
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -2416,6 +2708,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
     """
     mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic, min_area=hyp.min_area)
+    concatenate = Concatenate(dataset, imgsz, p=hyp.concatenate)
     affine = RandomPerspective(
         degrees=hyp.degrees,
         translate=hyp.translate,
@@ -2426,7 +2719,7 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
         area_thr=hyp.area_thr,
     )
 
-    pre_transform = Compose([mosaic, affine])
+    pre_transform = Compose([mosaic, concatenate, affine])
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(p=hyp.copy_paste, mode=hyp.copy_paste_mode))
     else:

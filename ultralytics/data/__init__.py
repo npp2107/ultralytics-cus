@@ -10,6 +10,7 @@ from .dataset import (
     YOLODataset,
     YOLOMultiModalDataset,
 )
+from .augment import Concatenate
 
 __all__ = (
     "BaseDataset",
@@ -23,4 +24,5 @@ __all__ = (
     "build_grounding",
     "build_yolo_dataset",
     "load_inference_source",
+    "Concatenate"
 )

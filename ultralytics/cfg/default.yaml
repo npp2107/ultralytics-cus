@@ -127,6 +127,7 @@ save_training_imgs: False
 save_val: False
 save_dir_img: ''
 save_dir_lbl: ''
+concatenate: 0.0
 copy_paste: 0.0 # (float) segmentation copy-paste probability
 copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup
 auto_augment: randaugment # (str) classification auto augmentation policy: randaugment, autoaugment, augmix

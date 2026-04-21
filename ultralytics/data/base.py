@@ -396,7 +396,7 @@ class BaseDataset(Dataset):
 
             # Nếu save_val=False và tên file chứa "val", thì không lưu
             im_file = data.get("im_file", "aug.jpg")
-            if not self.save_val and "val" in im_file.lower():
+            if not self.save_val and "\\val\\" in im_file.lower():
                 return data  # không lưu, chỉ trả về data
 
             # ================== LƯU ẢNH + LABEL SAU AUGMENT ==================
