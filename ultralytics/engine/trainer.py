@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -62,7 +63,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-
+from ultralytics.utils.loss import DistillationLoss
 
 class BaseTrainer:
     """A base class for creating trainers.
@@ -131,6 +132,18 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+        
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.loss_type = overrides.get("distillation_loss", None)
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            if "distillation_loss" in overrides:
+                overrides.pop("distillation_loss")
+        else:
+            self.loss_type = None
+            self.teacher = None
+
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -281,6 +294,7 @@ class BaseTrainer:
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(
             model=self.model,
+            teacher=self.teacher,
             name=self.args.optimizer,
             lr=self.args.lr0,
             momentum=self.args.momentum,
@@ -293,6 +307,13 @@ class BaseTrainer:
         """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+        
+        # Load teacher model to device
+        if self.teacher is not None:
+            for k, v in self.teacher.named_parameters():
+                v.requires_grad = True
+            self.teacher = self.teacher.to(self.device)
+            
         self.set_model_attributes()
 
         # Compile model
@@ -335,6 +356,10 @@ class BaseTrainer:
         )
         if self.world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+                        
+            if self.teacher is not None:
+                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+                temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -381,6 +406,10 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+                # make loss
+        if self.teacher is not None:
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+        
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
@@ -404,6 +433,10 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+                        
+            if self.teacher is not None:
+                distillation_loss.register_hook()
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -437,10 +470,21 @@ class BaseTrainer:
                         self.loss = loss.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
-                        self.tloss = (
-                            self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
-                        )
 
+                    # Add more distillation logic
+                    if self.teacher is not None:
+                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        with torch.no_grad():
+                            pred = self.teacher(batch['img'])
+                            
+                        self.d_loss = distillation_loss.get_loss()
+                        self.d_loss *= distill_weight
+                        self.loss += self.d_loss
+                        self.loss_items = torch.cat((self.loss_items, self.d_loss.detach().view(1)))
+                    
+                    self.tloss = (
+                        self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                    )
                     # Backward
                     self.scaler.scale(self.loss).backward()
                 except torch.cuda.OutOfMemoryError:
@@ -498,12 +542,16 @@ class BaseTrainer:
             else:
                 # for/else: this block runs only when the for loop completes without break (no OOM retry)
                 self._oom_retries = 0  # reset OOM counter after successful first epoch
-
+            
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
+                
+            # More distillation logic
+            if self.teacher is not None:
+                distillation_loss.remove_handle_()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
@@ -566,6 +614,11 @@ class BaseTrainer:
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()
+                
+        # Distill logic
+        if self.teacher is not None:
+            distillation_loss.remove_handle_()
+
         self.run_callbacks("teardown")
 
     def auto_batch(self, max_num_obj=0, dataset_size=0):
@@ -961,11 +1014,12 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
-    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """Construct an optimizer for the given model.
 
         Args:
             model (torch.nn.Module): The model for which to build an optimizer.
+            teacher (torch.nn.Module): the teacher model that will help the model to improve.
             name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected based on the
                 number of iterations.
             lr (float, optional): The learning rate for the optimizer.
@@ -1003,7 +1057,25 @@ class BaseTrainer:
                 else:  # weight (with decay)
                     g[0][fullname] = param
         if not use_muon:
-            g = [x.values() for x in g[:3]]  # convert to list of params
+            g = [list(x.values()) for x in g[:3]]  # convert to list of params
+        
+        if teacher is not None:
+            for i, v in enumerate(teacher.modules()):
+                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                    if isinstance(g[2], list):
+                        g[2].append(v.bias)
+                    else:
+                        g[2][f"teacher.{i}.bias"] = v.bias
+                if isinstance(v, bn):  # weight (no decay)
+                    if isinstance(g[1], list):
+                        g[1].append(v.weight)
+                    else:
+                        g[1][f"teacher.{i}.weight"] = v.weight
+                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                    if isinstance(g[0], list):
+                        g[0].append(v.weight)
+                    else:
+                        g[0][f"teacher.{i}.weight"] = v.weight
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
