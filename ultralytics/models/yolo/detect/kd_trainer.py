@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import distributed as dist
 from torch import nn, optim
 
@@ -62,9 +63,10 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
+from ultralytics.utils.loss import DistillationLoss
+from ultralytics.models.yolo.detect import DetectionTrainer
 
-
-class BaseTrainer:
+class KD_Trainer(DetectionTrainer):
     """A base class for creating trainers.
 
     This class provides the foundation for training YOLO models, handling the training loop, validation, checkpointing,
@@ -131,6 +133,19 @@ class BaseTrainer:
         self.validator = None
         self.metrics = None
         self.plots = {}
+        self.distill_loss_weight = self.args.distill_loss_weight
+        
+        if overrides:
+            self.teacher = overrides.get("teacher", None)
+            self.loss_type = overrides.get("distillation_loss", None)
+            if "teacher" in overrides:
+                overrides.pop("teacher")
+            if "distillation_loss" in overrides:
+                overrides.pop("distillation_loss")
+        else:
+            self.loss_type = None
+            self.teacher = None
+
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
         # Dirs
@@ -281,6 +296,7 @@ class BaseTrainer:
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
         self.optimizer = self.build_optimizer(
             model=self.model,
+            teacher=self.teacher,
             name=self.args.optimizer,
             lr=self.args.lr0,
             momentum=self.args.momentum,
@@ -293,6 +309,13 @@ class BaseTrainer:
         """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
+        
+        # Load teacher model to device
+        if self.teacher is not None:
+            for k, v in self.teacher.named_parameters():
+                v.requires_grad = True
+            self.teacher = self.teacher.to(self.device)
+            
         self.set_model_attributes()
 
         # Compile model
@@ -335,6 +358,10 @@ class BaseTrainer:
         )
         if self.world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+                        
+            if self.teacher is not None:
+                self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
+                temp = self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -381,6 +408,10 @@ class BaseTrainer:
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+                # make loss
+        if self.teacher is not None:
+            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight)
+        
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
@@ -404,6 +435,10 @@ class BaseTrainer:
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
+                        
+            if self.teacher is not None:
+                distillation_loss.register_hook()
+
             for i, batch in pbar:
                 self.run_callbacks("on_train_batch_start")
                 # Warmup
@@ -437,10 +472,21 @@ class BaseTrainer:
                         self.loss = loss.sum()
                         if RANK != -1:
                             self.loss *= self.world_size
-                        self.tloss = (
-                            self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
-                        )
 
+                    # Add more distillation logic
+                    if self.teacher is not None:
+                        distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                        with torch.no_grad():
+                            pred = self.teacher(batch['img'])
+                            
+                        self.d_loss = distillation_loss.get_loss()
+                        self.d_loss *= distill_weight
+                        self.loss += self.d_loss
+                        self.loss_items = torch.cat((self.loss_items, self.d_loss.detach().view(1)))
+                    
+                    self.tloss = (
+                        self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
+                    )
                     # Backward
                     self.scaler.scale(self.loss).backward()
                 except torch.cuda.OutOfMemoryError:
@@ -498,12 +544,16 @@ class BaseTrainer:
             else:
                 # for/else: this block runs only when the for loop completes without break (no OOM retry)
                 self._oom_retries = 0  # reset OOM counter after successful first epoch
-
+            
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
+                
+            # More distillation logic
+            if self.teacher is not None:
+                distillation_loss.remove_handle_()
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
 
@@ -566,406 +616,19 @@ class BaseTrainer:
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()
+                
+        # Distill logic
+        if self.teacher is not None:
+            distillation_loss.remove_handle_()
+
         self.run_callbacks("teardown")
 
-    def auto_batch(self, max_num_obj=0, dataset_size=0):
-        """Calculate optimal batch size based on model and device memory constraints."""
-        max_imgsz = int(self.args.imgsz * (1 + self.args.multi_scale))  # need not be stride-aligned
-        return check_train_batch_size(
-            model=self.model,
-            imgsz=max_imgsz,
-            amp=self.amp,
-            batch=self.batch_size,
-            max_num_obj=max_num_obj,
-            dataset_size=dataset_size,
-        )  # returns batch size
-
-    def _get_memory(self, fraction=False):
-        """Get accelerator memory utilization in GB or as a fraction of total memory."""
-        memory, total = 0, 0
-        if self.device.type == "mps":
-            memory = torch.mps.driver_allocated_memory()
-            if fraction:
-                return __import__("psutil").virtual_memory().percent / 100
-        elif self.device.type != "cpu":
-            memory = torch.cuda.memory_reserved()
-            if fraction:
-                total = torch.cuda.get_device_properties(self.device).total_memory
-        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2**30)
-
-    def _clear_memory(self, threshold: float | None = None):
-        """Clear accelerator memory by calling garbage collector and emptying cache."""
-        if threshold:
-            assert 0 <= threshold <= 1, "Threshold must be between 0 and 1."
-            if self._get_memory(fraction=True) <= threshold:
-                return
-        gc.collect()
-        if self.device.type == "mps":
-            torch.mps.empty_cache()
-        elif self.device.type == "cpu":
-            return
-        else:
-            torch.cuda.empty_cache()
-
-    def read_results_csv(self):
-        """Read results.csv into a dictionary using polars."""
-        import polars as pl  # scope for faster 'import ultralytics'
-
-        try:
-            return pl.read_csv(self.csv, infer_schema_length=None).to_dict(as_series=False)
-        except Exception:
-            return {}
-
-    def _model_train(self):
-        """Set model in training mode."""
-        self.model.train()
-        # Freeze BN stat
-        for n, m in self.model.named_modules():
-            if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
-                m.eval()
-
-    def save_model(self):
-        """Save model training checkpoints with additional metadata."""
-        import io
-
-        # Serialize ckpt to a byte buffer once (faster than repeated torch.save() calls)
-        buffer = io.BytesIO()
-        torch.save(
-            {
-                "epoch": self.epoch,
-                "best_fitness": self.best_fitness,
-                "model": None,  # resume and final checkpoints derive from EMA
-                "ema": deepcopy(unwrap_model(self.ema.ema)).half(),
-                "updates": self.ema.updates,
-                "optimizer": convert_optimizer_state_dict_to_fp16(deepcopy(self.optimizer.state_dict())),
-                "scaler": self.scaler.state_dict(),
-                "train_args": vars(self.args),  # save as dict
-                "train_metrics": {**self.metrics, **{"fitness": self.fitness}},
-                "train_results": self.read_results_csv(),
-                "date": datetime.now().isoformat(),
-                "version": __version__,
-                "git": {
-                    "root": str(GIT.root),
-                    "branch": GIT.branch,
-                    "commit": GIT.commit,
-                    "origin": GIT.origin,
-                },
-                "license": "AGPL-3.0 (https://ultralytics.com/license)",
-                "docs": "https://docs.ultralytics.com",
-            },
-            buffer,
-        )
-        serialized_ckpt = buffer.getvalue()  # get the serialized content to save
-
-        # Save checkpoints
-        self.wdir.mkdir(parents=True, exist_ok=True)  # ensure weights directory exists
-        self.last.write_bytes(serialized_ckpt)  # save last.pt
-        if self.best_fitness == self.fitness:
-            self.best.write_bytes(serialized_ckpt)  # save best.pt
-        if (self.save_period > 0) and (self.epoch % self.save_period == 0):
-            (self.wdir / f"epoch{self.epoch}.pt").write_bytes(serialized_ckpt)  # save epoch, i.e. 'epoch3.pt'
-
-    def get_dataset(self):
-        """Get train and validation datasets from data dictionary.
-
-        Returns:
-            (dict): A dictionary containing the training/validation/test dataset and category names.
-        """
-        try:
-            # Convert ul:// platform URIs and NDJSON files to local dataset format first
-            data_str = str(self.args.data)
-            if data_str.endswith(".ndjson") or (data_str.startswith("ul://") and "/datasets/" in data_str):
-                import asyncio
-
-                from ultralytics.data.converter import convert_ndjson_to_yolo
-                from ultralytics.utils.checks import check_file
-
-                self.args.data = str(asyncio.run(convert_ndjson_to_yolo(check_file(self.args.data))))
-
-            # Task-specific dataset checking
-            if self.args.task == "classify":
-                data = check_cls_dataset(self.args.data)
-            elif str(self.args.data).rsplit(".", 1)[-1] in {"yaml", "yml"} or self.args.task in {
-                "detect",
-                "segment",
-                "pose",
-                "obb",
-            }:
-                data = check_det_dataset(self.args.data)
-                if "yaml_file" in data:
-                    self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
-        except Exception as e:
-            raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
-        if self.args.single_cls:
-            LOGGER.info("Overriding class names with single class.")
-            data["names"] = {0: "item"}
-            data["nc"] = 1
-        return data
-
-    def setup_model(self):
-        """Load, create, or download model for any task.
-
-        Returns:
-            (dict | None): Checkpoint to resume training from, or None if no checkpoint is loaded.
-        """
-        if isinstance(self.model, torch.nn.Module):  # if model is loaded beforehand. No setup needed
-            return
-
-        cfg, weights = self.model, None
-        ckpt = None
-        if str(self.model).endswith(".pt"):
-            weights, ckpt = load_checkpoint(self.model)
-            cfg = weights.yaml
-        elif isinstance(self.args.pretrained, (str, Path)):
-            weights, _ = load_checkpoint(self.args.pretrained)
-        self.model = self.get_model(cfg=cfg, weights=weights, verbose=RANK == -1)  # calls Model(cfg, weights)
-        return ckpt
-
-    def optimizer_step(self):
-        """Perform a single step of the training optimizer with gradient clipping and EMA update."""
-        self.scaler.unscale_(self.optimizer)  # unscale gradients
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-        self.optimizer.zero_grad()
-        if self.ema:
-            self.ema.update(self.model)
-
-    def preprocess_batch(self, batch):
-        """Allow custom preprocessing of model inputs and ground truths depending on task type."""
-        return batch
-
-    def validate(self):
-        """Run validation on val set using self.validator.
-
-        Returns:
-            (tuple): A tuple containing:
-                - metrics (dict | None): Dictionary of validation metrics, or None if validation was skipped.
-                - fitness (float | None): Fitness score for the validation, or None if validation was skipped.
-        """
-        if self.ema and self.world_size > 1:
-            # Sync EMA buffers from rank 0 to all ranks
-            for buffer in self.ema.ema.buffers():
-                dist.broadcast(buffer, src=0)
-        metrics = self.validator(self)
-        if metrics is None:
-            return None, None
-        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        if not self.best_fitness or self.best_fitness < fitness:
-            self.best_fitness = fitness
-        return metrics, fitness
-
-    def get_model(self, cfg=None, weights=None, verbose=True):
-        """Get model and raise NotImplementedError for loading cfg files."""
-        raise NotImplementedError("This task trainer doesn't support loading cfg files")
-
-    def get_validator(self):
-        """Raise NotImplementedError (must be implemented by subclasses)."""
-        raise NotImplementedError("get_validator function not implemented in trainer")
-
-    def get_dataloader(self, dataset_path, batch_size=16, rank=0, mode="train"):
-        """Raise NotImplementedError (must return a `torch.utils.data.DataLoader` in subclasses)."""
-        raise NotImplementedError("get_dataloader function not implemented in trainer")
-
-    def build_dataset(self, img_path, mode="train", batch=None):
-        """Build dataset."""
-        raise NotImplementedError("build_dataset function not implemented in trainer")
-
-    def label_loss_items(self, loss_items=None, prefix="train"):
-        """Return a loss dict with labeled training loss items, or a list of loss names if loss_items is None.
-
-        Notes:
-            This is not needed for classification but necessary for segmentation & detection.
-        """
-        return {"loss": loss_items} if loss_items is not None else ["loss"]
-
-    def set_model_attributes(self):
-        """Set or update model parameters before training."""
-        self.model.names = self.data["names"]
-
-    def build_targets(self, preds, targets):
-        """Build target tensors for training YOLO model."""
-        pass
-
-    def progress_string(self):
-        """Return a string describing training progress."""
-        return ""
-
-    # TODO: may need to put these following functions into callback
-    def plot_training_samples(self, batch, ni):
-        """Plot training samples during YOLO training."""
-        pass
-
-    def plot_training_labels(self):
-        """Plot training labels for YOLO model."""
-        pass
-
-    def save_metrics(self, metrics):
-        """Save training metrics to a CSV file."""
-        keys, vals = list(metrics.keys()), list(metrics.values())
-        n = len(metrics) + 2  # number of cols
-        t = time.time() - self.train_time_start
-        self.csv.parent.mkdir(parents=True, exist_ok=True)  # ensure parent directory exists
-        s = "" if self.csv.exists() else ("%s," * n % ("epoch", "time", *keys)).rstrip(",") + "\n"
-        with open(self.csv, "a", encoding="utf-8") as f:
-            f.write(s + ("%.6g," * n % (self.epoch + 1, t, *vals)).rstrip(",") + "\n")
-
-    def plot_metrics(self):
-        """Plot metrics from a CSV file."""
-        plot_results(file=self.csv, on_plot=self.on_plot)  # save results.png
-
-    def on_plot(self, name, data=None):
-        """Register plots (e.g. to be consumed in callbacks)."""
-        path = Path(name)
-        self.plots[path] = {"data": data, "timestamp": time.time()}
-
-    def final_eval(self):
-        """Perform final evaluation and validation for the YOLO model."""
-        model = self.best if self.best.exists() else None
-        with torch_distributed_zero_first(LOCAL_RANK):  # strip only on GPU 0; other GPUs should wait
-            if RANK in {-1, 0}:
-                ckpt = strip_optimizer(self.last) if self.last.exists() else {}
-                if model:
-                    # update best.pt train_metrics from last.pt
-                    strip_optimizer(self.best, updates={"train_results": ckpt.get("train_results")})
-        if model:
-            LOGGER.info(f"\nValidating {model}...")
-            self.validator.args.plots = self.args.plots
-            self.validator.args.compile = False  # disable final val compile as too slow
-            self.metrics = self.validator(model=model)
-            self.metrics.pop("fitness", None)
-            self.run_callbacks("on_fit_epoch_end")
-
-    def check_resume(self, overrides):
-        """Check if resume checkpoint exists and update arguments accordingly."""
-        resume = self.args.resume
-        if resume:
-            try:
-                exists = isinstance(resume, (str, Path)) and Path(resume).exists()
-                last = Path(check_file(resume) if exists else get_latest_run())
-                ckpt_args = load_checkpoint(last)[0].args
-                if not isinstance(ckpt_args["data"], dict) and not Path(ckpt_args["data"]).exists():
-                    ckpt_args["data"] = self.args.data
-
-                resume = True
-                self.args = get_cfg(ckpt_args)
-                self.args.model = self.args.resume = str(last)  # reinstate model
-                for k in (
-                    "imgsz",
-                    "batch",
-                    "device",
-                    "close_mosaic",
-                    "augmentations",
-                    "save_period",
-                    "workers",
-                    "cache",
-                    "patience",
-                    "time",
-                    "freeze",
-                    "val",
-                    "plots",
-                ):  # allow arg updates to reduce memory or update device on resume
-                    if k in overrides:
-                        setattr(self.args, k, overrides[k])
-
-                # Handle augmentations parameter for resume: check if user provided custom augmentations
-                if ckpt_args.get("augmentations") is not None:
-                    # Augmentations were saved in checkpoint as reprs but can't be restored automatically
-                    LOGGER.warning(
-                        "Custom Albumentations transforms were used in the original training run but are not "
-                        "being restored. To preserve custom augmentations when resuming, you need to pass the "
-                        "'augmentations' parameter again to get expected results. Example: \n"
-                        f"model.train(resume=True, augmentations={ckpt_args['augmentations']})"
-                    )
-
-            except Exception as e:
-                raise FileNotFoundError(
-                    "Resume checkpoint not found. Please pass a valid checkpoint to resume from, "
-                    "i.e. 'yolo train resume model=path/to/last.pt'"
-                ) from e
-        self.resume = resume
-
-    def _load_checkpoint_state(self, ckpt):
-        """Load optimizer, scaler, EMA, and best_fitness from checkpoint."""
-        if ckpt.get("optimizer") is not None:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-        if ckpt.get("scaler") is not None:
-            self.scaler.load_state_dict(ckpt["scaler"])
-        if self.ema and ckpt.get("ema"):
-            self.ema = ModelEMA(self.model)  # validation with EMA creates inference tensors that can't be updated
-            self.ema.ema.load_state_dict(ckpt["ema"].float().state_dict())
-            self.ema.updates = ckpt["updates"]
-        self.best_fitness = ckpt.get("best_fitness", 0.0)
-
-    def _handle_nan_recovery(self, epoch):
-        """Detect and recover from NaN/Inf loss and fitness collapse by loading last checkpoint."""
-        loss_nan = self.loss is not None and not self.loss.isfinite()
-        fitness_nan = self.fitness is not None and not np.isfinite(self.fitness)
-        fitness_collapse = self.best_fitness and self.best_fitness > 0 and self.fitness == 0
-        corrupted = RANK in {-1, 0} and loss_nan and (fitness_nan or fitness_collapse)
-        reason = "Loss NaN/Inf" if loss_nan else "Fitness NaN/Inf" if fitness_nan else "Fitness collapse"
-        if RANK != -1:  # DDP: broadcast to all ranks
-            broadcast_list = [corrupted if RANK == 0 else None]
-            dist.broadcast_object_list(broadcast_list, 0)
-            corrupted = broadcast_list[0]
-        if not corrupted:
-            return False
-        if epoch == self.start_epoch or not self.last.exists():
-            LOGGER.warning(f"{reason} detected but can not recover from last.pt...")
-            return False  # Cannot recover on first epoch, let training continue
-        self.nan_recovery_attempts += 1
-        if self.nan_recovery_attempts > 3:
-            raise RuntimeError(f"Training failed: NaN persisted for {self.nan_recovery_attempts} epochs")
-        LOGGER.warning(f"{reason} detected (attempt {self.nan_recovery_attempts}/3), recovering from last.pt...")
-        self._model_train()  # set model to train mode before loading checkpoint to avoid inference tensor errors
-        _, ckpt = load_checkpoint(self.last)
-        ema_state = ckpt["ema"].float().state_dict()
-        if not all(torch.isfinite(v).all() for v in ema_state.values() if isinstance(v, torch.Tensor)):
-            raise RuntimeError(f"Checkpoint {self.last} is corrupted with NaN/Inf weights")
-        unwrap_model(self.model).load_state_dict(ema_state)  # Load EMA weights into model
-        self._load_checkpoint_state(ckpt)  # Load optimizer/scaler/EMA/best_fitness
-        del ckpt, ema_state
-        self.scheduler.last_epoch = epoch - 1
-        return True
-
-    def resume_training(self, ckpt):
-        """Resume YOLO training from a given checkpoint."""
-        if ckpt is None or not self.resume:
-            return
-        start_epoch = ckpt.get("epoch", -1) + 1
-        assert start_epoch > 0, (
-            f"{self.args.model} training to {self.epochs} epochs is finished, nothing to resume.\n"
-            f"Start a new training without resuming, i.e. 'yolo train model={self.args.model}'"
-        )
-        LOGGER.info(f"Resuming training {self.args.model} from epoch {start_epoch + 1} to {self.epochs} total epochs")
-        if self.epochs < start_epoch:
-            LOGGER.info(
-                f"{self.model} has been trained for {ckpt['epoch']} epochs. Fine-tuning for {self.epochs} more epochs."
-            )
-            self.epochs += ckpt["epoch"]  # finetune additional epochs
-        self._load_checkpoint_state(ckpt)
-        if unwrap_model(self.model).end2end:
-            # initialize loss and resume o2o and o2m args
-            unwrap_model(self.model).criterion = unwrap_model(self.model).init_criterion()
-            unwrap_model(self.model).criterion.updates = start_epoch - 1
-            unwrap_model(self.model).criterion.update()
-        self.start_epoch = start_epoch
-        if start_epoch > (self.epochs - self.args.close_mosaic):
-            self._close_dataloader_mosaic()
-
-    def _close_dataloader_mosaic(self):
-        """Update dataloaders to stop using mosaic augmentation."""
-        if hasattr(self.train_loader.dataset, "mosaic"):
-            self.train_loader.dataset.mosaic = False
-        if hasattr(self.train_loader.dataset, "close_mosaic"):
-            LOGGER.info("Closing dataloader mosaic")
-            self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
-
-    def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
+    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """Construct an optimizer for the given model.
 
         Args:
             model (torch.nn.Module): The model for which to build an optimizer.
+            teacher (torch.nn.Module): the teacher model that will help the model to improve.
             name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected based on the
                 number of iterations.
             lr (float, optional): The learning rate for the optimizer.
@@ -1003,7 +666,25 @@ class BaseTrainer:
                 else:  # weight (with decay)
                     g[0][fullname] = param
         if not use_muon:
-            g = [x.values() for x in g[:3]]  # convert to list of params
+            g = [list(x.values()) for x in g[:3]]  # convert to list of params
+        
+        if teacher is not None:
+            for i, v in enumerate(teacher.modules()):
+                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                    if isinstance(g[2], list):
+                        g[2].append(v.bias)
+                    else:
+                        g[2][f"teacher.{i}.bias"] = v.bias
+                if isinstance(v, bn):  # weight (no decay)
+                    if isinstance(g[1], list):
+                        g[1].append(v.weight)
+                    else:
+                        g[1][f"teacher.{i}.weight"] = v.weight
+                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                    if isinstance(g[0], list):
+                        g[0].append(v.weight)
+                    else:
+                        g[0][f"teacher.{i}.weight"] = v.weight
 
         optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())

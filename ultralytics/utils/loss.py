@@ -1406,7 +1406,7 @@ class FeatureLoss(nn.Module):
 
 
 class DistillationLoss:
-    def __init__(self, models, modelt, distiller="CWDLoss"):
+    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=1.0):
         self.distiller = distiller
         self.layers = ["6", "8", "13", "16", "19", "22"]
         self.models = models 
@@ -1430,7 +1430,8 @@ class DistillationLoss:
         self.distill_loss_fn = FeatureLoss(
             channels_s=self.channels_s, 
             channels_t=self.channels_t, 
-            distiller=distiller[:3]
+            distiller=distiller[:3], 
+            loss_weight=distill_loss_weight
         )
         
     def _find_layers(self):
