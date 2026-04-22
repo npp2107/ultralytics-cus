@@ -161,17 +161,18 @@ class FeatureLoss(nn.Module):
         return self.loss_weight * loss
 
 class DistillationLoss:
-    def __init__(self, models, modelt, distiller="CWDLoss"):
+    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=0.3, s_layers=["6", "8", "13", "16", "19", "22"], t_layers=["6", "8", "13", "16", "19", "22"]):
         self.distiller = distiller
-        self.s_layers = ["6", "8", "13", "16", "19", "22"]
-        self.t_layers = ["6", "8", "13", "16", "19", "22"]
+        self.s_layers = s_layers
+        self.t_layers = t_layers
         self.models = models 
         self.modelt = modelt
+        self.distill_loss_weight = distill_loss_weight
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         # ini warm up
         with torch.no_grad():
-            dummy_input = torch.randn(1, 3, 640, 640)
+            dummy_input = torch.randn(1, 3, 192, 192)
             _ = self.models(dummy_input.to(device))
             _ = self.modelt(dummy_input.to(device))
         
@@ -268,7 +269,7 @@ class DistillationLoss:
         quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs)
         
         if self.distiller != 'cwd':
-            quant_loss *= 0.3
+            quant_loss *= self.distill_loss_weight
 
         self.teacher_outputs.clear()
         self.student_outputs.clear()

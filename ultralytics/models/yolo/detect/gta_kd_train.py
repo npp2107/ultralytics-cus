@@ -48,10 +48,10 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-from ultralytics.utils.kd_loss import DistillationLoss
+from ultralytics.utils.gta_kd_loss import GTADistillationLoss
 from ultralytics.models.yolo.detect import DetectionTrainer
 
-class KD_Trainer(DetectionTrainer):
+class GTA_KD_Trainer(DetectionTrainer):
     """A base class for creating trainers.
 
     This class provides the foundation for training YOLO models, handling the training loop, validation, checkpointing,
@@ -118,8 +118,10 @@ class KD_Trainer(DetectionTrainer):
         self.validator = None
         self.metrics = None
         self.plots = {}
-        self.distill_loss_weight = overrides.get("distill_loss_weight", 1.0)
+        self.distill_loss_weight = overrides.get("distill_loss_weight", 0.3)
         self.cos_d_loss = overrides.get("cos_d_loss", True)
+        self.s_layers = overrides.get("s_layers", ["6", "8", "13", "16", "19", "22"])
+        self.t_layers = overrides.get("t_layers", ["6", "8", "13", "16", "19", "22"])
         
         if overrides:
             self.teacher = overrides.get("teacher", None)
@@ -182,7 +184,12 @@ class KD_Trainer(DetectionTrainer):
             self.run_callbacks("on_pretrain_routine_start")
 
         # Model and Dataset
-        self.model = check_model_file_from_stem(self.args.model)  # add suffix, i.e. yolo26n -> yolo26n.pt
+        # self.model = check_model_file_from_stem(self.args.model) 
+        self.model = self.args.model
+        if hasattr(self.model, 'model') and not isinstance(self.model, torch.nn.Module):
+            self.model = self.model.model  # extract nn.Module from YOLO wrapper
+        if isinstance(self.model, str):
+            self.model = check_model_file_from_stem(self.model)  # add suffix, i.e. yolo26n -> yolo26n.pt
         with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
             self.data = self.get_dataset()
 
@@ -396,7 +403,7 @@ class KD_Trainer(DetectionTrainer):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
                 # make loss
         if self.teacher is not None:
-            distillation_loss = DistillationLoss(self.model, self.teacher, distiller=self.loss_type)
+            distillation_loss = GTADistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight, s_layers=self.s_layers, t_layers=self.t_layers)
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -469,7 +476,7 @@ class KD_Trainer(DetectionTrainer):
                         with torch.no_grad():
                             pred = self.teacher(batch['img'])
                             
-                        self.d_loss = distillation_loss.get_loss()
+                        self.d_loss = distillation_loss.get_loss(batch, pred)
                         self.d_loss *= distill_weight
                         self.loss += self.d_loss
                         self.loss_items = torch.cat((self.loss_items, self.d_loss.detach().view(1)))

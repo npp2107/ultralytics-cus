@@ -41,8 +41,10 @@ compile: False # (bool | str) enable torch.compile() backend='inductor'; True="d
 
 teacher: None
 distillation_loss: None
-distill_loss_weight: 1.0
+distill_loss_weight: 0.3
 cos_d_loss: True
+s_layers: ["6", "8", "13", "16", "19", "22"]
+t_layers: ["6", "8", "13", "16", "19", "22"]
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)
