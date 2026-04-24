@@ -186,13 +186,20 @@ class GTADistillationLoss:
     """Ground Truth Aware Distillation Loss.
     Filters distillation to focus on regions corresponding to Ground Truth boxes.
     """
-    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=0.3, s_layers=["6", "8", "13", "16", "19", "22"], t_layers=["6", "8", "13", "16", "19", "22"]):
+    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=0.3, 
+                 s_layers=["6", "8", "13", "16", "19", "22"], 
+                 t_layers=["6", "8", "13", "16", "19", "22"],
+                 class_mapping=None,
+                 teacher_pred_conf=0.01
+                 ):
         self.distiller = distiller
         self.s_layers = s_layers
         self.t_layers = t_layers
         self.models = models 
         self.modelt = modelt
         self.distill_loss_weight = distill_loss_weight
+        self.class_mapping = class_mapping
+        self.teacher_pred_conf = teacher_pred_conf
 
         device = next(models.parameters()).device
         # Init warm up
@@ -301,6 +308,7 @@ class GTADistillationLoss:
         """
         bboxes_gt = batch.get('bboxes')
         batch_idx_gt = batch.get('batch_idx')
+        cls_gt = batch.get('cls')
         if bboxes_gt is None or batch_idx_gt is None:
             return None
         
@@ -315,15 +323,29 @@ class GTADistillationLoss:
             for i in range(N):
                 errors = []
                 img_gt = bboxes_gt[batch_idx_gt == i]
+                img_cls_gt = cls_gt[batch_idx_gt == i] if cls_gt is not None else None
                 
                 # pred shape (nc + 4, 8400)
                 pred = teacher_preds[i]
                 boxes = pred[:4, :].T # (8400, 4)
-                scores, _ = pred[4:, :].max(0) # (8400,)
+                scores, class_ids = pred[4:, :].max(0) # (8400,)
                 
                 # Filter by confidence
-                conf_mask = scores > 0.25
+                conf_mask = scores > self.teacher_pred_conf
                 det_boxes = boxes[conf_mask]
+                det_cls = class_ids[conf_mask]
+
+                if self.class_mapping is not None:
+                    # Filter and remap teacher classes to student classes
+                    mask_in_mapping = torch.zeros_like(det_cls, dtype=torch.bool)
+                    remapped_cls = det_cls.clone()
+                    for k, v in self.class_mapping.items():
+                        k_mask = (det_cls == int(k))
+                        mask_in_mapping |= k_mask
+                        remapped_cls[k_mask] = v
+                    
+                    det_boxes = det_boxes[mask_in_mapping]
+                    det_cls = remapped_cls[mask_in_mapping]
                 
                 # Normalize teacher boxes to [0, 1] (scaling depends on imgsz used in forward)
                 det_boxes_norm = det_boxes.clone()
@@ -334,6 +356,12 @@ class GTADistillationLoss:
                     if len(det_boxes_norm) > 0:
                         # Match with IoU
                         iou = self._bbox_iou_batch(det_boxes_norm, img_gt) # (K, M)
+                        
+                        if img_cls_gt is not None:
+                            # Only match if classes are consistent (after mapping)
+                            # det_cls: (K,), img_cls_gt: (M, 1) or (M,)
+                            cls_match = (det_cls.unsqueeze(1) == img_cls_gt.view(1, -1))
+                            iou = iou * cls_match.float()
                         
                         # FPs: Detections with no GT match
                         max_iou_det, _ = iou.max(1)

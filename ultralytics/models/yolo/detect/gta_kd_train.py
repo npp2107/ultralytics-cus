@@ -122,6 +122,8 @@ class GTA_KD_Trainer(DetectionTrainer):
         self.cos_d_loss = overrides.get("cos_d_loss", True)
         self.s_layers = overrides.get("s_layers", ["6", "8", "13", "16", "19", "22"])
         self.t_layers = overrides.get("t_layers", ["6", "8", "13", "16", "19", "22"])
+        self.class_mapping = overrides.get("class_mapping", None)
+        self.teacher_pred_conf = overrides.get("teacher_pred_conf", 0.01)
         
         if overrides:
             self.teacher = overrides.get("teacher", None)
@@ -403,7 +405,7 @@ class GTA_KD_Trainer(DetectionTrainer):
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
                 # make loss
         if self.teacher is not None:
-            distillation_loss = GTADistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight, s_layers=self.s_layers, t_layers=self.t_layers)
+            distillation_loss = GTADistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight, s_layers=self.s_layers, t_layers=self.t_layers, class_mapping=self.class_mapping, teacher_pred_conf=self.teacher_pred_conf)
         
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
@@ -469,10 +471,10 @@ class GTA_KD_Trainer(DetectionTrainer):
                     # Add more distillation logic
                     if self.teacher is not None:
                         if self.cos_d_loss:
-                            distill_weight = self.distill_loss_weight * ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
+                            distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
                         else: 
                             ratio = 1 - (i / len(self.train_loader))
-                            distill_weight = self.distill_loss_weight * (0.1 + 0.9 * ratio)
+                            distill_weight = (0.1 + 0.9 * ratio)
                         with torch.no_grad():
                             pred = self.teacher(batch['img'])
                             
