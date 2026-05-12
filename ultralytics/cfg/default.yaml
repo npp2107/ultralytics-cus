@@ -65,7 +65,7 @@ max_det: 300 # (int) maximum number of detections per image
 half: False # (bool) use half precision (FP16) if supported
 dnn: False # (bool) use OpenCV DNN for ONNX inference
 plots: True # (bool) save plots and images during train/val
-save_mAP: False 
+save_mAP: False
 end2end: # (bool, optional) whether to use end2end head (YOLO26, YOLOv10) for predict/val/export
 
 # Predict settings -----------------------------------------------------------------------------------------------------
@@ -135,8 +135,8 @@ min_area: 0.0 # (float) minimum bounding box area after clipping
 area_thr: 0.0 # (float) area threshold for filtering boxes
 save_training_imgs: False
 save_val: False
-save_dir_img: ''
-save_dir_lbl: ''
+save_dir_img: ""
+save_dir_lbl: ""
 concatenate: 0.0
 copy_paste: 0.0 # (float) segmentation copy-paste probability
 copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup
@@ -145,7 +145,7 @@ erasing: 0.4 # (float) random erasing probability for classification (0.0–1.0)
 
 # Save preprocessed images
 save_preprocessed_img: False
-save_img_dir: ''
+save_img_dir: ""
 
 # Custom config.yaml ---------------------------------------------------------------------------------------------------
 cfg: # (str, optional) path to a config.yaml that overrides defaults

@@ -1,5 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from .augment import Concatenate
 from .base import BaseDataset
 from .build import build_dataloader, build_grounding, build_yolo_dataset, load_inference_source
 from .dataset import (
@@ -10,11 +11,11 @@ from .dataset import (
     YOLODataset,
     YOLOMultiModalDataset,
 )
-from .augment import Concatenate
 
 __all__ = (
     "BaseDataset",
     "ClassificationDataset",
+    "Concatenate",
     "GroundingDataset",
     "SemanticDataset",
     "YOLOConcatDataset",
@@ -24,5 +25,4 @@ __all__ = (
     "build_grounding",
     "build_yolo_dataset",
     "load_inference_source",
-    "Concatenate"
 )
