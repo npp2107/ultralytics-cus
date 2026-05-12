@@ -259,8 +259,10 @@ class BaseValidator:
         else:
             if RANK > 0:
                 return stats
-            speed_info = "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
-                *tuple(self.speed.values())
+            speed_info = (
+                "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
+                    *tuple(self.speed.values())
+                )
             )
             LOGGER.info(speed_info)
 
@@ -280,7 +282,7 @@ class BaseValidator:
             if self.args.plots or self.args.save_json or self.args.get("save_mAP", False):
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
-            
+
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
     ) -> torch.Tensor:
