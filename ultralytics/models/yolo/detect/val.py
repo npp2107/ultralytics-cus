@@ -254,22 +254,27 @@ class DetectionValidator(BaseValidator):
     def print_results(self) -> None:
         """Print training/validation set metrics per class."""
         pf = "%22s" + "%11i" * 2 + "%11.3g" * len(self.metrics.keys)  # print format
-        LOGGER.info(pf % ("all", self.seen, self.metrics.nt_per_class.sum(), *self.metrics.mean_results()))
+        header = self.get_desc()
+        all_row = pf % ("all", self.seen, self.metrics.nt_per_class.sum(), *self.metrics.mean_results())
+        LOGGER.info(header)
+        LOGGER.info(all_row)
+
+        self.results_txt = f"{header}\n{all_row}\n"
+
         if self.metrics.nt_per_class.sum() == 0:
             LOGGER.warning(f"no labels found in {self.args.task} set, cannot compute metrics without labels")
 
         # Print results per class
         if self.args.verbose and not self.training and self.nc > 1 and len(self.metrics.stats):
             for i, c in enumerate(self.metrics.ap_class_index):
-                LOGGER.info(
-                    pf
-                    % (
-                        self.names[c],
-                        self.metrics.nt_per_image[c],
-                        self.metrics.nt_per_class[c],
-                        *self.metrics.class_result(i),
-                    )
+                row = pf % (
+                    self.names[c],
+                    self.metrics.nt_per_image[c],
+                    self.metrics.nt_per_class[c],
+                    *self.metrics.class_result(i),
                 )
+                LOGGER.info(row)
+                self.results_txt += f"{row}\n"
 
     def _process_batch(self, preds: dict[str, torch.Tensor], batch: dict[str, Any]) -> dict[str, np.ndarray]:
         """Return correct prediction matrix.

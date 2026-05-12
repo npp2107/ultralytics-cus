@@ -224,11 +224,7 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    loss_items = model.loss(batch, preds)[1]
-                    if self.loss.shape[0] > loss_items.shape[0]:
-                        self.loss[: loss_items.shape[0]] += loss_items
-                    else:
-                        self.loss += loss_items
+                    self.loss += model.loss(batch, preds)[1]
 
             # Postprocess
             with dt[3]:
@@ -263,20 +259,28 @@ class BaseValidator:
         else:
             if RANK > 0:
                 return stats
-            LOGGER.info(
-                "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
-                    *tuple(self.speed.values())
-                )
+            speed_info = "Speed: {:.1f}ms preprocess, {:.1f}ms inference, {:.1f}ms loss, {:.1f}ms postprocess per image".format(
+                *tuple(self.speed.values())
             )
+            LOGGER.info(speed_info)
+
+            if self.args.get("save_mAP", False):
+                results_txt = getattr(self, "results_txt", "")
+                results_txt += speed_info + "\n"
+                save_path = self.save_dir / "mAP.txt"
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(results_txt)
+                LOGGER.info(f"mAP results saved to {save_path}")
+
             if self.args.save_json and self.jdict:
                 with open(str(self.save_dir / "predictions.json"), "w", encoding="utf-8") as f:
                     LOGGER.info(f"Saving {f.name}...")
                     json.dump(self.jdict, f)  # flatten and save
                 stats = self.eval_json(stats)  # update stats
-            if self.args.plots or self.args.save_json:
+            if self.args.plots or self.args.save_json or self.args.get("save_mAP", False):
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
-
+            
     def match_predictions(
         self, pred_classes: torch.Tensor, true_classes: torch.Tensor, iou: torch.Tensor, use_scipy: bool = False
     ) -> torch.Tensor:
