@@ -87,8 +87,8 @@ class BaseDataset(Dataset):
         channels: int = 3,
         save_training_imgs: bool = False,
         save_val: bool = False,
-        save_dir_img: str = None,
-        save_dir_lbl: str = None
+        save_dir_img: str | None = None,
+        save_dir_lbl: str | None = None,
     ):
         """Initialize BaseDataset with given configuration and options.
 
@@ -385,10 +385,12 @@ class BaseDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         """Return transformed label information for given index."""
-        import uuid
         import os
+        import uuid
+
         import cv2
         import numpy as np
+
         if not self.save_training_imgs:
             return self.transforms(self.get_image_and_label(index))
         else:
@@ -420,7 +422,7 @@ class BaseDataset(Dataset):
 
             # Lưu ảnh
             unique_id = str(uuid.uuid4())[:8]
-            filename = os.path.splitext(os.path.basename(im_file))[0] 
+            filename = os.path.splitext(os.path.basename(im_file))[0]
             filename = f"{filename}_{unique_id}"
             img_path = os.path.join(save_dir_img, f"{filename}.jpg")
             cv2.imwrite(img_path, img[..., ::-1])  # RGB -> BGR
@@ -434,7 +436,7 @@ class BaseDataset(Dataset):
                 classes = data.get("cls", [])
 
             # Ép kiểu về Numpy array và đảm bảo định dạng
-            bboxes = np.array(bboxes).reshape(-1, 4) 
+            bboxes = np.array(bboxes).reshape(-1, 4)
             classes = np.array(classes).flatten()
 
             # Lưu label
