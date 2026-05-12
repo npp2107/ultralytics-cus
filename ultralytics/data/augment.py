@@ -898,13 +898,11 @@ class Concatenate(BaseMixTransform):
         """
         assert labels.get("rect_shape") is None, "rect and mosaic are mutually exclusive."
         assert len(labels.get("mix_labels", [])), "There are no other images for mosaic augment."
-        return (
-            self._concatenate(labels)
-        )  # This code is modified for mosaic3 method.
+        return self._concatenate(labels)  # This code is modified for mosaic3 method.
 
     def _concatenate(self, labels: dict[str, Any]) -> dict[str, Any]:
         """Create a 2x2 image mosaic from four input images using custom row/col scaling logic.
-        
+
         Args:
             labels (dict[str, Any]): A dictionary containing image data and labels for the base image (index 0) and
                 three additional images (indices 1-3) in the 'mix_labels' key.
@@ -912,39 +910,40 @@ class Concatenate(BaseMixTransform):
         Returns:
             (dict[str, Any]): A dictionary containing the mosaic image and updated labels.
         """
-        if "KM20_LC_HN_Cao_toc_Noi_Bai_Lao_Cai_TOC_DO_231_15-13-01.200__29B14269__ve" in labels["im_file"] :
+        if "KM20_LC_HN_Cao_toc_Noi_Bai_Lao_Cai_TOC_DO_231_15-13-01.200__29B14269__ve" in labels["im_file"]:
             print("jasdjoiasdjoiasjoi")
-        import cv2 # Đảm bảo cv2 đã được import trong file
+        import cv2  # Đảm bảo cv2 đã được import trong file
+
         mosaic_labels = []
-        
+
         # Lấy danh sách 4 ảnh (1 ảnh gốc + 3 ảnh mix)
-        patches = [labels] + labels.get("mix_labels", [])
+        patches = [labels, *labels.get("mix_labels", [])]
         if len(patches) < 4:
             raise ValueError("Mosaic4 requires exactly 4 images.")
-            
+
         cols = 2
         rows = []
         row_metadata = []
-        
+
         # 1. Build rows (Tạo từng hàng, mỗi hàng 2 ảnh)
         for row_start in range(0, 4, cols):
-            row_items = patches[row_start:row_start + cols]
-            
+            row_items = patches[row_start : row_start + cols]
+
             # Tìm chiều cao lớn nhất trong hàng để làm chuẩn
             target_h = max(patch["img"].shape[0] for patch in row_items)
-            
+
             row_crops = []
             current_x = 0
             row_meta = []
-            
+
             for patch in row_items:
                 # Xóa resized_shape cũ để tránh xung đột với pipeline gốc
                 if "resized_shape" in patch:
                     patch.pop("resized_shape")
-                    
+
                 img = patch["img"]
                 h, w = img.shape[:2]
-                
+
                 # Scale ảnh thứ nhất (Scale 1: cho bằng chiều cao target_h)
                 if h != target_h:
                     scale_1 = target_h / h
@@ -953,30 +952,26 @@ class Concatenate(BaseMixTransform):
                 else:
                     scale_1 = 1.0
                     img_resized = img
-                    
+
                 # Lưu metadata để tính toán tọa độ box sau này
-                row_meta.append({
-                    'patch': patch,
-                    'scale_1': scale_1,
-                    'col_x_start': current_x
-                })
+                row_meta.append({"patch": patch, "scale_1": scale_1, "col_x_start": current_x})
                 row_crops.append(img_resized)
                 current_x += img_resized.shape[1]
-                
+
             # Nối các ảnh theo chiều ngang
             row_img = cv2.hconcat(row_crops)
             rows.append(row_img)
             row_metadata.append(row_meta)
-            
+
         # 2. Combine rows (Ghép các hàng lại với nhau)
         # Tìm chiều rộng lớn nhất của các hàng để làm chuẩn
         target_w = max(row_img.shape[1] for row_img in rows)
         final_rows = []
         current_y = 0
-        
+
         for row_idx, row_img in enumerate(rows):
             h, w = row_img.shape[:2]
-            
+
             # Scale hàng (Scale 2: cho bằng chiều rộng target_w)
             if w != target_w:
                 scale_2 = target_w / w
@@ -985,36 +980,36 @@ class Concatenate(BaseMixTransform):
             else:
                 scale_2 = 1.0
                 row_resized = row_img
-                
+
             final_rows.append(row_resized)
-            
+
             # Cập nhật Tọa độ / Labels cho từng ảnh trong hàng hiện tại
             for meta in row_metadata[row_idx]:
-                patch = meta['patch']
-                scale_1 = meta['scale_1']
-                col_x_start = meta['col_x_start']
-                
+                patch = meta["patch"]
+                scale_1 = meta["scale_1"]
+                col_x_start = meta["col_x_start"]
+
                 # Tổng hợp scale và tọa độ dịch chuyển
                 total_scale = scale_1 * scale_2
                 padw = col_x_start * scale_2
                 padh = current_y
-                
+
                 # Cập nhật scale cho bounding boxes/segments bằng API của Ultralytics
                 if "instances" in patch:
                     patch["instances"].scale(scale_w=total_scale, scale_h=total_scale)
-                
+
                 # Cập nhật translation (dịch chuyển box về vị trí mới trong lưới ghép)
                 patch = self._update_labels(patch, padw, padh)
                 mosaic_labels.append(patch)
-                
+
             current_y += row_resized.shape[0]
-            
+
         # Nối các hàng theo chiều dọc
         final_img = cv2.vconcat(final_rows)
-        
+
         # Gộp tất cả labels của 4 ảnh thành 1 mảng chung
         final_labels = self._cat_labels(mosaic_labels)
-        
+
         # 3. Final Resize (Quan trọng)
         # Pipeline của Ultralytics (các bước augment phía sau như RandomPerspective)
         # thường kỳ vọng kết quả của Mosaic có kích thước đúng bằng (imgsz * 2, imgsz * 2).
@@ -1025,8 +1020,8 @@ class Concatenate(BaseMixTransform):
             final_img = cv2.resize(final_img, (s, s))
             if "instances" in final_labels:
                 # Scale các box theo tỷ lệ vừa resize ép kiểu
-                final_labels["instances"].scale(scale_w=s/fw, scale_h=s/fh)
-                
+                final_labels["instances"].scale(scale_w=s / fw, scale_h=s / fh)
+
         final_labels["img"] = final_img
         return final_labels
 
@@ -1086,7 +1081,7 @@ class Concatenate(BaseMixTransform):
             return {}
         cls = []
         instances = []
-        imgsz = self.imgsz # mosaic imgsz
+        imgsz = self.imgsz  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
@@ -1104,6 +1099,7 @@ class Concatenate(BaseMixTransform):
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
+
 
 class MixUp(BaseMixTransform):
     """Apply MixUp augmentation to image datasets.
@@ -1583,7 +1579,9 @@ class RandomPerspective:
         instances.scale(scale_w=scale, scale_h=scale, bbox_only=True)
         # Make the bboxes have the same scale with new_bboxes
         i = self.box_candidates(
-            box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.01 if len(segments) else self.area_thr
+            box1=instances.bboxes.T,
+            box2=new_instances.bboxes.T,
+            area_thr=0.01 if len(segments) else self.area_thr,
             # box1=instances.bboxes.T, box2=new_instances.bboxes.T, area_thr=0.6
         )
         labels["instances"] = new_instances[i]
@@ -2073,13 +2071,10 @@ except ImportError:
 
 
 class CustomCopyPasteTransform(A.DualTransform if A is not None else object):
-    """
-    Custom Transform performing Copy-Paste augmentation:
-    1. Select a random box from class_ids_cpy to copy the corresponding image region.
-    2. Paste it in a random position ensuring it doesn't overlap with hard_non_overlay_classes
-       and its center doesn't overlap with soft_non_overlay_classes.
-    3. Repeat number_of_cpy times.
-    4. Updates the image only; bboxes and labels remain unchanged.
+    """Custom Transform performing Copy-Paste augmentation: 1. Select a random box from class_ids_cpy to copy the
+    corresponding image region. 2. Paste it in a random position ensuring it doesn't overlap with
+    hard_non_overlay_classes and its center doesn't overlap with soft_non_overlay_classes. 3. Repeat number_of_cpy
+    times. 4. Updates the image only; bboxes and labels remain unchanged.
     """
 
     def __init__(
@@ -2213,7 +2208,6 @@ class CustomCopyPasteTransform(A.DualTransform if A is not None else object):
         return bboxes
 
 
-
 try:
     import albumentations as A
 except ImportError:
@@ -2221,13 +2215,10 @@ except ImportError:
 
 
 class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else object):
-    """
-    Custom Transform performing Copy-Paste augmentation:
-    1. Select a random box from class_ids_cpy to copy the corresponding image region.
-    2. Paste it in a random position ensuring it doesn't overlap with hard_non_overlay_classes
-       and its center doesn't overlap with soft_non_overlay_classes.
-    3. Repeat number_of_cpy times.
-    4. Updates the image and removes bounding boxes covered beyond a visibility threshold.
+    """Custom Transform performing Copy-Paste augmentation: 1. Select a random box from class_ids_cpy to copy the
+    corresponding image region. 2. Paste it in a random position ensuring it doesn't overlap with
+    hard_non_overlay_classes and its center doesn't overlap with soft_non_overlay_classes. 3. Repeat number_of_cpy
+    times. 4. Updates the image and removes bounding boxes covered beyond a visibility threshold.
     """
 
     def __init__(
@@ -2253,7 +2244,13 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
 
     def get_transform_init_args_names(self):
         """Returns the names of the initialization arguments."""
-        return ("number_of_cpy", "hard_non_overlay_classes", "soft_non_overlay_classes", "min_visibility", "bbox_format")
+        return (
+            "number_of_cpy",
+            "hard_non_overlay_classes",
+            "soft_non_overlay_classes",
+            "min_visibility",
+            "bbox_format",
+        )
 
     def __call__(self, *args, force_apply=False, **kwargs):
         """Applies the Copy-Paste augmentation to the image and labels."""
@@ -2311,7 +2308,7 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
         active_indices = list(range(len(pixel_bboxes)))
         pasted_patches = []
         image_copy = image.copy()
-        
+
         for _ in range(self.number_of_cpy):
             sx1, sy1, sx2, sy2 = big_box
 
@@ -2356,14 +2353,14 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
                     pasted_patch = [x1_paste, y1_paste, x2_paste, y2_paste]
                     pasted_patches.append(pasted_patch)
                     hard_boxes.append(pasted_patch)
-                    
+
                     # Update active indices and bboxes based on visibility
                     new_active_indices = []
                     for idx in active_indices:
                         vis, new_pixel_box = self._get_visibility(pixel_bboxes[idx], pasted_patches)
                         if vis >= self.min_visibility:
                             new_active_indices.append(idx)
-                            pixel_bboxes[idx][:] = new_pixel_box # Update in-place to affect hard_boxes/soft_boxes
+                            pixel_bboxes[idx][:] = new_pixel_box  # Update in-place to affect hard_boxes/soft_boxes
                     active_indices = new_active_indices
                 break
 
@@ -2379,7 +2376,7 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
                 new_box = [pb[0], pb[1], pb[2] - pb[0], pb[3] - pb[1]]
             else:  # pascal_voc
                 new_box = [pb[0], pb[1], pb[2], pb[3]]
-            
+
             orig_bbox = bboxes[idx]
             if len(orig_bbox) > 4:
                 new_box = list(new_box) + list(orig_bbox[4:])
@@ -2404,7 +2401,7 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
         bw, bh = bx2 - bx1, by2 - by1
         if bw <= 0 or bh <= 0:
             return 0.0, bbox
-        
+
         # Use a small mask to calculate overlapping area exactly
         mask = np.ones((bh, bw), dtype=np.uint8)
         for px1, py1, px2, py2 in patches:
@@ -2412,24 +2409,24 @@ class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else obje
             iy1 = max(by1, py1)
             ix2 = min(bx2, px2)
             iy2 = min(by2, py2)
-            
+
             if ix2 > ix1 and iy2 > iy1:
                 mask[iy1 - by1 : iy2 - by1, ix1 - bx1 : ix2 - bx1] = 0
-        
+
         vis_sum = np.sum(mask)
         visibility = vis_sum / (bw * bh)
-        
+
         if vis_sum == 0:
             return 0.0, [bx1, by1, bx1, by1]
-            
+
         # Find the bounding box of the remaining visible pixels in the mask
         coords = np.argwhere(mask)
         ymin, xmin = coords.min(axis=0)
         ymax, xmax = coords.max(axis=0)
-        
+
         # Convert back to original image coordinates [xmin, ymin, xmax, ymax]
         new_bbox = [bx1 + xmin, by1 + ymin, bx1 + xmax + 1, by1 + ymax + 1]
-        
+
         return visibility, new_bbox
 
     def apply(self, img, **params):
@@ -2466,7 +2463,9 @@ class Albumentations:
         - Some transforms are applied with very low probability (0.01) by default.
     """
 
-    def __init__(self, p: float = 1.0, transforms: list | None = None, area_thr: float = 0.0, min_area: float = 0.0) -> None:
+    def __init__(
+        self, p: float = 1.0, transforms: list | None = None, area_thr: float = 0.0, min_area: float = 0.0
+    ) -> None:
         """Initialize the Albumentations transform object for YOLO bbox formatted parameters.
 
         This class applies various image augmentations using the Albumentations library, including Blur, Median Blur,
@@ -2553,10 +2552,12 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], 
-                min_visibility=area_thr,
-                min_area=min_area
-                ))
+                A.Compose(
+                    T,
+                    bbox_params=A.BboxParams(
+                        format="yolo", label_fields=["class_labels"], min_visibility=area_thr, min_area=min_area
+                    ),
+                )
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -3122,7 +3123,9 @@ def v8_transforms(dataset, imgsz: int, hyp: IterableSimpleNamespace, stretch: bo
             pre_transform,
             MixUp(dataset, pre_transform=pre_transform, p=hyp.mixup),
             CutMix(dataset, pre_transform=pre_transform, p=hyp.cutmix),
-            Albumentations(p=1.0, transforms=getattr(hyp, "augmentations", None), area_thr=hyp.area_thr, min_area=hyp.min_area),
+            Albumentations(
+                p=1.0, transforms=getattr(hyp, "augmentations", None), area_thr=hyp.area_thr, min_area=hyp.min_area
+            ),
             RandomHSV(hgain=hyp.hsv_h, sgain=hyp.hsv_s, vgain=hyp.hsv_v),
             RandomFlip(direction="vertical", p=hyp.flipud, flip_idx=flip_idx),
             RandomFlip(direction="horizontal", p=hyp.fliplr, flip_idx=flip_idx),
