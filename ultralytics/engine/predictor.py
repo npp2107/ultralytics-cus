@@ -171,6 +171,22 @@ class BasePredictor:
         im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
         if not_tensor:
             im /= 255  # 0 - 255 to 0.0 - 1.0
+
+        # Save preprocessed images if enabled
+        if getattr(self.args, "save_preprocessed_img", False) and self.batch:
+            import cv2
+            from pathlib import Path
+            save_img_dir = Path(getattr(self.args, "save_img_dir", self.save_dir))
+            save_img_dir.mkdir(parents=True, exist_ok=True)
+            ims = im.detach().cpu().numpy()
+            if ims.max() <= 1.01:
+                ims *= 255
+            ims = ims.astype(np.uint8)
+            for i, p in enumerate(self.batch[0]):
+                out_im = ims[i].transpose(1, 2, 0)
+                out_im = cv2.cvtColor(out_im, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(save_img_dir / f"{Path(p).stem}_preprocessed.jpg"), out_im)
+
         return im
 
     def inference(self, im: torch.Tensor, *args, **kwargs):

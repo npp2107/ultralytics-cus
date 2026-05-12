@@ -2066,6 +2066,381 @@ class CopyPaste(BaseMixTransform):
         return labels1
 
 
+try:
+    import albumentations as A
+except ImportError:
+    A = None
+
+
+class CustomCopyPasteTransform(A.DualTransform if A is not None else object):
+    """
+    Custom Transform performing Copy-Paste augmentation:
+    1. Select a random box from class_ids_cpy to copy the corresponding image region.
+    2. Paste it in a random position ensuring it doesn't overlap with hard_non_overlay_classes
+       and its center doesn't overlap with soft_non_overlay_classes.
+    3. Repeat number_of_cpy times.
+    4. Updates the image only; bboxes and labels remain unchanged.
+    """
+
+    def __init__(
+        self,
+        number_of_cpy=1,
+        class_ids_cpy=None,
+        hard_non_overlay_classes=None,
+        soft_non_overlay_classes=None,
+        bbox_format="yolo",
+        always_apply=False,
+        p=0.5,
+    ):
+        """Initializes the CustomCopyPasteTransform with Copy-Paste parameters."""
+        if A is None:
+            raise ImportError("albumentations is required for CustomCopyPasteTransform")
+        super().__init__(always_apply, p)
+        self.number_of_cpy = number_of_cpy
+        self.class_ids_cpy = class_ids_cpy if class_ids_cpy is not None else []
+        self.hard_non_overlay_classes = hard_non_overlay_classes if hard_non_overlay_classes is not None else []
+        self.soft_non_overlay_classes = soft_non_overlay_classes if soft_non_overlay_classes is not None else []
+        self.bbox_format = bbox_format
+        self.p = p
+
+    def get_transform_init_args_names(self):
+        """Returns the names of the initialization arguments."""
+        return ("number_of_cpy", "class_ids_cpy", "hard_non_overlay_classes", "soft_non_overlay_classes", "bbox_format")
+
+    def __call__(self, *args, force_apply=False, **kwargs):
+        """Applies the Copy-Paste augmentation to the image and labels."""
+        if not (force_apply or random.random() < self.p):
+            return kwargs
+
+        # Ensure bboxes are present in kwargs
+        if "bboxes" not in kwargs and "image" in kwargs:
+            return kwargs
+
+        image = kwargs.get("image")
+        bboxes = kwargs.get("bboxes", [])
+        class_labels = kwargs.get("class_labels")
+
+        if image is None or len(bboxes) == 0:
+            return kwargs
+
+        # Get labels from class_labels or from index 4 of bboxes
+        labels = class_labels if class_labels is not None else [bbox[4] if len(bbox) > 4 else 0 for bbox in bboxes]
+
+        height, width = image.shape[:2]
+        pixel_bboxes = []
+
+        # Convert bboxes to pixel coordinates [xmin, ymin, xmax, ymax]
+        for bbox in bboxes:
+            if self.bbox_format == "yolo":
+                # xywh normalized -> xyxy pixel
+                x1, y1, x2, y2 = xywh2xyxy(np.array(bbox[:4]))
+                x1, x2 = x1 * width, x2 * width
+                y1, y2 = y1 * height, y2 * height
+            elif self.bbox_format == "albumentations":
+                x1, y1, x2, y2 = bbox[:4]
+                x1, x2 = x1 * width, x2 * width
+                y1, y2 = y1 * height, y2 * height
+            elif self.bbox_format == "coco":
+                x1, y1, w, h = bbox[:4]
+                x2, y2 = x1 + w, y1 + h
+            else:  # pascal_voc
+                x1, y1, x2, y2 = bbox[:4]
+
+            pixel_bboxes.append([int(max(0, x1)), int(max(0, y1)), int(min(width, x2)), int(min(height, y2))])
+
+        # Filter indices based on classes
+        src_indices = [i for i, label in enumerate(labels) if label in self.class_ids_cpy]
+        hard_boxes = [pixel_bboxes[i] for i, label in enumerate(labels) if label in self.hard_non_overlay_classes]
+        soft_boxes = [pixel_bboxes[i] for i, label in enumerate(labels) if label in self.soft_non_overlay_classes]
+
+        if src_indices:
+            image_copy = image.copy()
+            for _ in range(self.number_of_cpy):
+                src_idx = random.choice(src_indices)
+                sx1, sy1, sx2, sy2 = pixel_bboxes[src_idx]
+
+                if sx2 <= sx1 or sy2 <= sy1:
+                    continue
+
+                patch = image[sy1:sy2, sx1:sx2]
+                ph, pw = patch.shape[:2]
+                if ph == 0 or pw == 0:
+                    continue
+
+                # Search for a safe position
+                for _ in range(50):  # max_attempts
+                    px1 = random.randint(0, max(0, width - pw))
+                    py1 = random.randint(0, max(0, height - ph))
+                    px2, py2 = px1 + pw, py1 + ph
+
+                    overlap = False
+                    # Check hard non-overlay classes
+                    for hx1, hy1, hx2, hy2 in hard_boxes:
+                        if not (px2 <= hx1 or px1 >= hx2 or py2 <= hy1 or py1 >= hy2):
+                            overlap = True
+                            break
+                    if overlap:
+                        continue
+
+                    # Check soft non-overlay classes (center point)
+                    pcx, pcy = px1 + pw / 2, py1 + ph / 2
+                    for sx1_soft, sy1_soft, sx2_soft, sy2_soft in soft_boxes:
+                        if sx1_soft <= pcx <= sx2_soft and sy1_soft <= pcy <= sy2_soft:
+                            overlap = True
+                            break
+                    if overlap:
+                        continue
+
+                    # Apply paste
+                    y1_paste, y2_paste = py1, min(height, py2)
+                    x1_paste, x2_paste = px1, min(width, px2)
+                    ph_paste, pw_paste = y2_paste - y1_paste, x2_paste - x1_paste
+                    if ph_paste > 0 and pw_paste > 0:
+                        image_copy[y1_paste:y2_paste, x1_paste:x2_paste] = patch[:ph_paste, :pw_paste]
+                        hard_boxes.append([x1_paste, y1_paste, x2_paste, y2_paste])
+                    break
+
+            kwargs["image"] = image_copy
+
+        return super().__call__(*args, force_apply=True, **kwargs)
+
+    def apply(self, img, **params):
+        """Returns the image (already modified in __call__)."""
+        return img
+
+    def apply_to_bboxes(self, bboxes, **params):
+        """Returns bounding boxes unchanged."""
+        return bboxes
+
+
+
+try:
+    import albumentations as A
+except ImportError:
+    A = None
+
+
+class CustomCopyPasteTransform_AllBox(A.DualTransform if A is not None else object):
+    """
+    Custom Transform performing Copy-Paste augmentation:
+    1. Select a random box from class_ids_cpy to copy the corresponding image region.
+    2. Paste it in a random position ensuring it doesn't overlap with hard_non_overlay_classes
+       and its center doesn't overlap with soft_non_overlay_classes.
+    3. Repeat number_of_cpy times.
+    4. Updates the image and removes bounding boxes covered beyond a visibility threshold.
+    """
+
+    def __init__(
+        self,
+        number_of_cpy=1,
+        hard_non_overlay_classes=None,
+        soft_non_overlay_classes=None,
+        min_visibility=0.5,
+        bbox_format="yolo",
+        always_apply=False,
+        p=0.5,
+    ):
+        """Initializes the CustomCopyPasteTransform with Copy-Paste parameters."""
+        if A is None:
+            raise ImportError("albumentations is required for CustomCopyPasteTransform")
+        super().__init__(always_apply, p)
+        self.number_of_cpy = number_of_cpy
+        self.hard_non_overlay_classes = hard_non_overlay_classes if hard_non_overlay_classes is not None else []
+        self.soft_non_overlay_classes = soft_non_overlay_classes if soft_non_overlay_classes is not None else []
+        self.min_visibility = min_visibility
+        self.bbox_format = bbox_format
+        self.p = p
+
+    def get_transform_init_args_names(self):
+        """Returns the names of the initialization arguments."""
+        return ("number_of_cpy", "hard_non_overlay_classes", "soft_non_overlay_classes", "min_visibility", "bbox_format")
+
+    def __call__(self, *args, force_apply=False, **kwargs):
+        """Applies the Copy-Paste augmentation to the image and labels."""
+        if not (force_apply or random.random() < self.p):
+            return kwargs
+
+        # Ensure bboxes are present in kwargs
+        if "bboxes" not in kwargs and "image" in kwargs:
+            return kwargs
+
+        image = kwargs.get("image")
+        bboxes = kwargs.get("bboxes", [])
+        class_labels = kwargs.get("class_labels")
+
+        if image is None or len(bboxes) == 0:
+            return kwargs
+
+        # Get labels from class_labels or from index 4 of bboxes
+        labels = class_labels if class_labels is not None else [bbox[4] if len(bbox) > 4 else 0 for bbox in bboxes]
+
+        height, width = image.shape[:2]
+        pixel_bboxes = []
+
+        # Convert bboxes to pixel coordinates [xmin, ymin, xmax, ymax]
+        for bbox in bboxes:
+            if self.bbox_format == "yolo":
+                # xywh normalized -> xyxy pixel
+                # x1, y1, x2, y2 = xywh2xyxy(np.array(bbox[:4]))
+                x1, y1, x2, y2 = np.array(bbox[:4])
+                x1, x2 = x1 * width, x2 * width
+                y1, y2 = y1 * height, y2 * height
+            elif self.bbox_format == "albumentations":
+                x1, y1, x2, y2 = bbox[:4]
+                x1, x2 = x1 * width, x2 * width
+                y1, y2 = y1 * height, y2 * height
+            elif self.bbox_format == "coco":
+                x1, y1, w, h = bbox[:4]
+                x2, y2 = x1 + w, y1 + h
+            else:  # pascal_voc
+                x1, y1, x2, y2 = bbox[:4]
+
+            pixel_bboxes.append([int(max(0, x1)), int(max(0, y1)), int(min(width, x2)), int(min(height, y2))])
+
+        # Filter indices based on classes
+        x_min = min(box[0] for box in pixel_bboxes)
+        y_min = min(box[1] for box in pixel_bboxes)
+        x_max = max(box[2] for box in pixel_bboxes)
+        y_max = max(box[3] for box in pixel_bboxes)
+
+        big_box = [x_min, y_min, x_max, y_max]
+
+        hard_boxes = [pixel_bboxes[i] for i, label in enumerate(labels) if label in self.hard_non_overlay_classes]
+        soft_boxes = [pixel_bboxes[i] for i, label in enumerate(labels) if label in self.soft_non_overlay_classes]
+
+        active_indices = list(range(len(pixel_bboxes)))
+        pasted_patches = []
+        image_copy = image.copy()
+        
+        for _ in range(self.number_of_cpy):
+            sx1, sy1, sx2, sy2 = big_box
+
+            if sx2 <= sx1 or sy2 <= sy1:
+                continue
+
+            patch = image[sy1:sy2, sx1:sx2]
+            ph, pw = patch.shape[:2]
+            if ph == 0 or pw == 0:
+                continue
+
+            # Search for a safe position
+            for _ in range(50):  # max_attempts
+                px1 = random.randint(0, max(0, width - pw))
+                py1 = random.randint(0, max(0, height - ph))
+                px2, py2 = px1 + pw, py1 + ph
+
+                overlap = False
+                # Check hard non-overlay classes
+                for hx1, hy1, hx2, hy2 in hard_boxes:
+                    if not (px2 <= hx1 or px1 >= hx2 or py2 <= hy1 or py1 >= hy2):
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+
+                # Check soft non-overlay classes (center point)
+                pcx, pcy = px1 + pw / 2, py1 + ph / 2
+                for sx1_soft, sy1_soft, sx2_soft, sy2_soft in soft_boxes:
+                    if sx1_soft <= pcx <= sx2_soft and sy1_soft <= pcy <= sy2_soft:
+                        overlap = True
+                        break
+                if overlap:
+                    continue
+
+                # Apply paste
+                y1_paste, y2_paste = py1, min(height, py2)
+                x1_paste, x2_paste = px1, min(width, px2)
+                ph_paste, pw_paste = y2_paste - y1_paste, x2_paste - x1_paste
+                if ph_paste > 0 and pw_paste > 0:
+                    image_copy[y1_paste:y2_paste, x1_paste:x2_paste] = patch[:ph_paste, :pw_paste]
+                    pasted_patch = [x1_paste, y1_paste, x2_paste, y2_paste]
+                    pasted_patches.append(pasted_patch)
+                    hard_boxes.append(pasted_patch)
+                    
+                    # Update active indices and bboxes based on visibility
+                    new_active_indices = []
+                    for idx in active_indices:
+                        vis, new_pixel_box = self._get_visibility(pixel_bboxes[idx], pasted_patches)
+                        if vis >= self.min_visibility:
+                            new_active_indices.append(idx)
+                            pixel_bboxes[idx][:] = new_pixel_box # Update in-place to affect hard_boxes/soft_boxes
+                    active_indices = new_active_indices
+                break
+
+        kwargs["image"] = image_copy
+        # Prepare updated bboxes in original format
+        updated_bboxes_list = []
+        for idx in active_indices:
+            pb = pixel_bboxes[idx]
+            if self.bbox_format in ("yolo", "albumentations"):
+                # Convert back to normalized coordinates
+                new_box = [pb[0] / width, pb[1] / height, pb[2] / width, pb[3] / height]
+            elif self.bbox_format == "coco":
+                new_box = [pb[0], pb[1], pb[2] - pb[0], pb[3] - pb[1]]
+            else:  # pascal_voc
+                new_box = [pb[0], pb[1], pb[2], pb[3]]
+            
+            orig_bbox = bboxes[idx]
+            if len(orig_bbox) > 4:
+                new_box = list(new_box) + list(orig_bbox[4:])
+            updated_bboxes_list.append(new_box)
+
+        if isinstance(bboxes, np.ndarray):
+            kwargs["bboxes"] = np.array(updated_bboxes_list, dtype=bboxes.dtype)
+        else:
+            kwargs["bboxes"] = updated_bboxes_list
+
+        if class_labels is not None:
+            if isinstance(class_labels, np.ndarray):
+                kwargs["class_labels"] = class_labels[active_indices]
+            else:
+                kwargs["class_labels"] = [class_labels[i] for i in active_indices]
+
+        return super().__call__(*args, force_apply=True, **kwargs)
+
+    def _get_visibility(self, bbox, patches):
+        """Calculates the visibility ratio and the updated bounding box of the visible part."""
+        bx1, by1, bx2, by2 = bbox
+        bw, bh = bx2 - bx1, by2 - by1
+        if bw <= 0 or bh <= 0:
+            return 0.0, bbox
+        
+        # Use a small mask to calculate overlapping area exactly
+        mask = np.ones((bh, bw), dtype=np.uint8)
+        for px1, py1, px2, py2 in patches:
+            ix1 = max(bx1, px1)
+            iy1 = max(by1, py1)
+            ix2 = min(bx2, px2)
+            iy2 = min(by2, py2)
+            
+            if ix2 > ix1 and iy2 > iy1:
+                mask[iy1 - by1 : iy2 - by1, ix1 - bx1 : ix2 - bx1] = 0
+        
+        vis_sum = np.sum(mask)
+        visibility = vis_sum / (bw * bh)
+        
+        if vis_sum == 0:
+            return 0.0, [bx1, by1, bx1, by1]
+            
+        # Find the bounding box of the remaining visible pixels in the mask
+        coords = np.argwhere(mask)
+        ymin, xmin = coords.min(axis=0)
+        ymax, xmax = coords.max(axis=0)
+        
+        # Convert back to original image coordinates [xmin, ymin, xmax, ymax]
+        new_bbox = [bx1 + xmin, by1 + ymin, bx1 + xmax + 1, by1 + ymax + 1]
+        
+        return visibility, new_bbox
+
+    def apply(self, img, **params):
+        """Returns the image (already modified in __call__)."""
+        return img
+
+    def apply_to_bboxes(self, bboxes, **params):
+        """Returns bounding boxes (modified in __call__)."""
+        return bboxes
+
+
 class Albumentations:
     """Albumentations transformations for image augmentation.
 
@@ -2123,6 +2498,8 @@ class Albumentations:
                 "Crop",
                 "CropAndPad",
                 "CropNonEmptyMaskIfExists",
+                "CustomCopyPasteTransform",
+                "CustomCopyPasteTransform_AllBox",
                 "D4",
                 "ElasticTransform",
                 "Flip",

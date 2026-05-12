@@ -13,6 +13,7 @@ import os
 import subprocess
 import time
 import warnings
+from copy import copy
 from datetime import timedelta
 from functools import partial
 
@@ -49,6 +50,7 @@ from ultralytics.utils.torch_utils import (
     unwrap_model,
 )
 from ultralytics.utils.kd_loss import DistillationLoss
+from ultralytics.models import yolo
 from ultralytics.models.yolo.detect import DetectionTrainer
 
 class KD_Trainer(DetectionTrainer):
@@ -223,6 +225,15 @@ class KD_Trainer(DetectionTrainer):
         """Run all existing callbacks associated with a particular event."""
         for callback in self.callbacks.get(event, []):
             callback(self)
+            
+    def get_validator(self):
+        """Return a DetectionValidator for YOLO model validation."""
+        self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+        if self.teacher is not None:
+            self.loss_names += ("kd_loss",)
+        return yolo.detect.DetectionValidator(
+            self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
+        )
 
     def train(self):
         """Execute the training process, using DDP subprocess for multi-GPU or direct training for single-GPU."""
@@ -305,6 +316,9 @@ class KD_Trainer(DetectionTrainer):
         
         # Load teacher model to device
         if self.teacher is not None:
+            if not hasattr(self.teacher, "named_parameters"):
+                from ultralytics import YOLO
+                self.teacher = YOLO(self.teacher).model
             for k, v in self.teacher.named_parameters():
                 v.requires_grad = True
             self.teacher = self.teacher.to(self.device)
