@@ -174,8 +174,10 @@ class BasePredictor:
 
         # Save preprocessed images if enabled
         if getattr(self.args, "save_preprocessed_img", False) and self.batch:
-            import cv2
             from pathlib import Path
+
+            import cv2
+
             save_img_dir = Path(getattr(self.args, "save_img_dir", self.save_dir))
             save_img_dir.mkdir(parents=True, exist_ok=True)
             ims = im.detach().cpu().numpy()
