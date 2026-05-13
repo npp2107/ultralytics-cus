@@ -277,7 +277,7 @@ class BaseValidator:
                     LOGGER.info(f"Saving {f.name}...")
                     json.dump(self.jdict, f)  # flatten and save
                 stats = self.eval_json(stats)  # update stats
-            if self.args.plots or self.args.save_json or self.args.get("save_mAP", False):
+            if self.args.plots or self.args.save_json or self.args.get("save_mAP", False) or self.args.get("save_FP_cases", False) or self.args.get("save_FN_cases", False):
                 LOGGER.info(f"Results saved to {colorstr('bold', self.save_dir)}")
             return stats
             

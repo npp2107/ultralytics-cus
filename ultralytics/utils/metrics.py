@@ -461,21 +461,32 @@ class ConfusionMatrix(DataExportMixin):
         # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
         return (tp, fp) if self.task == "classify" else (tp[:-1], fp[:-1])  # remove background class if task=detect
 
-    def plot_matches(self, img: torch.Tensor, im_file: str, save_dir: Path) -> None:
+    def plot_matches(self, img: torch.Tensor, im_file: str, save_dir: Path, visualize: bool = False, save_FP: bool = False, save_FN: bool = False) -> None:
         """Plot grid of GT, TP, FP, FN for each image.
 
         Args:
             img (torch.Tensor): Image to plot onto.
             im_file (str): Image filename to save visualizations.
             save_dir (Path): Location to save the visualizations to.
+            visualize (bool): Save all images to visualizations folder.
+            save_FP (bool): Save images with False Positives to FP_cases folder.
+            save_FN (bool): Save images with False Negatives to FN_cases folder.
         """
         if not self.matches:
             return
         from .ops import xyxy2xywh
         from .plotting import plot_images
 
-        # Create batch of 4 (GT, TP, FP, FN)
+        # Create batch of 4 (GT, FP, TP, FN)
         labels = defaultdict(list)
+        has_fp = len(self.matches["FP"]["bboxes"]) > 0
+        has_fn = len(self.matches["FN"]["bboxes"]) > 0
+        
+        # If standard visualization is OFF, and no errors found for requested cases, skip
+        if not visualize:
+            if not (save_FP and has_fp) and not (save_FN and has_fn):
+                return
+
         for i, mtype in enumerate(["GT", "FP", "TP", "FN"]):
             mbatch = self.matches[mtype]
             if "conf" not in mbatch:
@@ -487,16 +498,47 @@ class ConfusionMatrix(DataExportMixin):
         labels = {k: torch.stack(v, 0) if len(v) else torch.empty(0) for k, v in labels.items()}
         if self.task != "obb" and labels["bboxes"].shape[0]:
             labels["bboxes"] = xyxy2xywh(labels["bboxes"])
-        (save_dir / "visualizations").mkdir(parents=True, exist_ok=True)
-        plot_images(
-            labels,
-            img.repeat(4, 1, 1, 1),
-            paths=["Ground Truth", "False Positives", "True Positives", "False Negatives"],
-            fname=save_dir / "visualizations" / Path(im_file).name,
-            names=self.names,
-            max_subplots=4,
-            conf_thres=0.001,
-        )
+        
+        # Standard visualization (only if visualize=True)
+        if visualize:
+            (save_dir / "visualizations").mkdir(parents=True, exist_ok=True)
+            plot_images(
+                labels,
+                img.repeat(4, 1, 1, 1),
+                paths=["Ground Truth", "False Positives", "True Positives", "False Negatives"],
+                fname=save_dir / "visualizations" / Path(im_file).name,
+                names=self.names,
+                max_subplots=4,
+                conf_thres=0.001,
+            )
+        
+        # Save FP cases
+        if save_FP and has_fp:
+            fp_dir = save_dir / "FP_cases"
+            fp_dir.mkdir(parents=True, exist_ok=True)
+            plot_images(
+                labels,
+                img.repeat(4, 1, 1, 1),
+                paths=["Ground Truth", "False Positives", "True Positives", "False Negatives"],
+                fname=fp_dir / Path(im_file).name,
+                names=self.names,
+                max_subplots=4,
+                conf_thres=0.001,
+            )
+            
+        # Save FN cases
+        if save_FN and has_fn:
+            fn_dir = save_dir / "FN_cases"
+            fn_dir.mkdir(parents=True, exist_ok=True)
+            plot_images(
+                labels,
+                img.repeat(4, 1, 1, 1),
+                paths=["Ground Truth", "False Positives", "True Positives", "False Negatives"],
+                fname=fn_dir / Path(im_file).name,
+                names=self.names,
+                max_subplots=4,
+                conf_thres=0.001,
+            )
 
     @TryExcept(msg="ConfusionMatrix plot failure")
     @plt_settings()
