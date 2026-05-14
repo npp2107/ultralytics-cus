@@ -390,6 +390,8 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
                         f"'{k}' must be a bool (i.e. '{k}=True' or '{k}=False')"
                     )
                 cfg[k] = bool(v)
+            elif k == 'distillation_loss' and str(v).lower() not in {'cwd', 'mgd', 'none'}:
+                raise ValueError(f"'{k}={v}' is an invalid value. Valid '{k}' values are 'cwd', 'mgd' or None.")
 
 
 def get_save_dir(args: SimpleNamespace, name: str | None = None) -> Path:

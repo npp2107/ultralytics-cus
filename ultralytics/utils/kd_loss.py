@@ -99,7 +99,7 @@ class MGDLoss(nn.Module):
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
+    def __init__(self, channels_s, channels_t, distiller='cwd', loss_weight=1.0):
         super(FeatureLoss, self).__init__()
         self.loss_weight = loss_weight
         self.distiller = distiller
@@ -161,7 +161,7 @@ class FeatureLoss(nn.Module):
         return self.loss_weight * loss
 
 class DistillationLoss:
-    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=0.3, s_layers=["6", "8", "13", "16", "19", "22"], t_layers=["6", "8", "13", "16", "19", "22"]):
+    def __init__(self, models, modelt, distiller="cwd", distill_loss_weight=0.3, s_layers=["6", "8", "13", "16", "19", "22"], t_layers=["6", "8", "13", "16", "19", "22"]):
         self.distiller = distiller
         self.s_layers = s_layers
         self.t_layers = t_layers

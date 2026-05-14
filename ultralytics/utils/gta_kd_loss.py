@@ -131,7 +131,7 @@ class MGDLoss(nn.Module):
 
 
 class FeatureLoss(nn.Module):
-    def __init__(self, channels_s, channels_t, distiller='mgd', loss_weight=1.0):
+    def __init__(self, channels_s, channels_t, distiller='cwd', loss_weight=1.0):
         super(FeatureLoss, self).__init__()
         self.loss_weight = loss_weight
         self.distiller = distiller
@@ -186,7 +186,7 @@ class GTADistillationLoss:
     """Ground Truth Aware Distillation Loss.
     Filters distillation to focus on regions corresponding to Ground Truth boxes.
     """
-    def __init__(self, models, modelt, distiller="CWDLoss", distill_loss_weight=0.3, 
+    def __init__(self, models, modelt, distiller="cwd", distill_loss_weight=0.3, 
                  s_layers=["6", "8", "13", "16", "19", "22"], 
                  t_layers=["6", "8", "13", "16", "19", "22"],
                  class_mapping=None,
@@ -219,7 +219,7 @@ class GTADistillationLoss:
         self.distill_loss_fn = FeatureLoss(
             channels_s=self.channels_s, 
             channels_t=self.channels_t, 
-            distiller=distiller[:3].lower(), 
+            distiller=distiller[:3], 
         )
         
     def _find_layers(self):
@@ -293,7 +293,7 @@ class GTADistillationLoss:
 
         quant_loss = self.distill_loss_fn(y_s=self.student_outputs, y_t=self.teacher_outputs, masks=masks)
         
-        if self.distiller.lower() != 'cwdloss':
+        if self.distiller != 'cwd':
             quant_loss *= self.distill_loss_weight
 
         self.teacher_outputs.clear()
