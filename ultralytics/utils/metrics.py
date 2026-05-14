@@ -461,7 +461,15 @@ class ConfusionMatrix(DataExportMixin):
         # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
         return (tp, fp) if self.task == "classify" else (tp[:-1], fp[:-1])  # remove background class if task=detect
 
-    def plot_matches(self, img: torch.Tensor, im_file: str, save_dir: Path, visualize: bool = False, save_FP: bool = False, save_FN: bool = False) -> None:
+    def plot_matches(
+        self,
+        img: torch.Tensor,
+        im_file: str,
+        save_dir: Path,
+        visualize: bool = False,
+        save_FP: bool = False,
+        save_FN: bool = False,
+    ) -> None:
         """Plot grid of GT, TP, FP, FN for each image.
 
         Args:
@@ -481,7 +489,7 @@ class ConfusionMatrix(DataExportMixin):
         labels = defaultdict(list)
         has_fp = len(self.matches["FP"]["bboxes"]) > 0
         has_fn = len(self.matches["FN"]["bboxes"]) > 0
-        
+
         # If standard visualization is OFF, and no errors found for requested cases, skip
         if not visualize:
             if not (save_FP and has_fp) and not (save_FN and has_fn):
@@ -498,7 +506,7 @@ class ConfusionMatrix(DataExportMixin):
         labels = {k: torch.stack(v, 0) if len(v) else torch.empty(0) for k, v in labels.items()}
         if self.task != "obb" and labels["bboxes"].shape[0]:
             labels["bboxes"] = xyxy2xywh(labels["bboxes"])
-        
+
         # Standard visualization (only if visualize=True)
         if visualize:
             (save_dir / "visualizations").mkdir(parents=True, exist_ok=True)
@@ -511,7 +519,7 @@ class ConfusionMatrix(DataExportMixin):
                 max_subplots=4,
                 conf_thres=0.001,
             )
-        
+
         # Save FP cases
         if save_FP and has_fp:
             fp_dir = save_dir / "FP_cases"
@@ -525,7 +533,7 @@ class ConfusionMatrix(DataExportMixin):
                 max_subplots=4,
                 conf_thres=0.001,
             )
-            
+
         # Save FN cases
         if save_FN and has_fn:
             fn_dir = save_dir / "FN_cases"

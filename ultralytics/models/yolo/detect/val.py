@@ -98,7 +98,8 @@ class DetectionValidator(BaseValidator):
         self.metrics.names = model.names
         self.confusion_matrix = ConfusionMatrix(
             names=model.names,
-            save_matches=self.args.plots and (self.args.visualize or self.args.save_FP_cases or self.args.save_FN_cases),
+            save_matches=self.args.plots
+            and (self.args.visualize or self.args.save_FP_cases or self.args.save_FN_cases),
         )
 
     def get_desc(self) -> str:

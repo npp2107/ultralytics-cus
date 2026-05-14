@@ -23,6 +23,8 @@ from torch import distributed as dist
 from torch import nn, optim
 
 from ultralytics.cfg import get_cfg, get_save_dir
+from ultralytics.models import yolo
+from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.optim import MuSGD
 from ultralytics.utils import (
     DEFAULT_CFG,
@@ -34,8 +36,9 @@ from ultralytics.utils import (
     callbacks,
     colorstr,
 )
-from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
+from ultralytics.utils.checks import check_amp, check_imgsz, check_model_file_from_stem, print_args
 from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
+from ultralytics.utils.gta_kd_loss import GTADistillationLoss
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
@@ -49,9 +52,7 @@ from ultralytics.utils.torch_utils import (
     unset_deterministic,
     unwrap_model,
 )
-from ultralytics.utils.gta_kd_loss import GTADistillationLoss
-from ultralytics.models import yolo
-from ultralytics.models.yolo.detect import DetectionTrainer
+
 
 class GTA_KD_Trainer(DetectionTrainer):
     """A base class for creating trainers.
@@ -126,7 +127,7 @@ class GTA_KD_Trainer(DetectionTrainer):
         self.t_layers = overrides.get("t_layers", ["6", "8", "13", "16", "19", "22"])
         self.class_mapping = overrides.get("class_mapping", None)
         self.teacher_pred_conf = overrides.get("teacher_pred_conf", 0.01)
-        
+
         if overrides:
             self.teacher = overrides.get("teacher", None)
             self.loss_type = overrides.get("distillation_loss", None)
@@ -188,9 +189,9 @@ class GTA_KD_Trainer(DetectionTrainer):
             self.run_callbacks("on_pretrain_routine_start")
 
         # Model and Dataset
-        # self.model = check_model_file_from_stem(self.args.model) 
+        # self.model = check_model_file_from_stem(self.args.model)
         self.model = self.args.model
-        if hasattr(self.model, 'model') and not isinstance(self.model, torch.nn.Module):
+        if hasattr(self.model, "model") and not isinstance(self.model, torch.nn.Module):
             self.model = self.model.model  # extract nn.Module from YOLO wrapper
         if isinstance(self.model, str):
             self.model = check_model_file_from_stem(self.model)  # add suffix, i.e. yolo26n -> yolo26n.pt
@@ -315,16 +316,17 @@ class GTA_KD_Trainer(DetectionTrainer):
         """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
         ckpt = self.setup_model()
         self.model = self.model.to(self.device)
-        
+
         # Load teacher model to device
         if self.teacher is not None:
             if not hasattr(self.teacher, "named_parameters"):
                 from ultralytics import YOLO
+
                 self.teacher = YOLO(self.teacher).model
             for k, v in self.teacher.named_parameters():
                 v.requires_grad = True
             self.teacher = self.teacher.to(self.device)
-            
+
         self.set_model_attributes()
 
         # Compile model
@@ -367,10 +369,10 @@ class GTA_KD_Trainer(DetectionTrainer):
         )
         if self.world_size > 1:
             self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
-                        
+
             if self.teacher is not None:
                 self.teacher = nn.parallel.DistributedDataParallel(self.teacher, device_ids=[RANK])
-                temp = self.teacher.eval()
+                self.teacher.eval()
 
         # Check imgsz
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
@@ -417,10 +419,19 @@ class GTA_KD_Trainer(DetectionTrainer):
         if self.args.close_mosaic:
             base_idx = (self.epochs - self.args.close_mosaic) * nb
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
-                # make loss
+            # make loss
         if self.teacher is not None:
-            distillation_loss = GTADistillationLoss(self.model, self.teacher, distiller=self.loss_type, distill_loss_weight=self.distill_loss_weight, s_layers=self.s_layers, t_layers=self.t_layers, class_mapping=self.class_mapping, teacher_pred_conf=self.teacher_pred_conf)
-        
+            distillation_loss = GTADistillationLoss(
+                self.model,
+                self.teacher,
+                distiller=self.loss_type,
+                distill_loss_weight=self.distill_loss_weight,
+                s_layers=self.s_layers,
+                t_layers=self.t_layers,
+                class_mapping=self.class_mapping,
+                teacher_pred_conf=self.teacher_pred_conf,
+            )
+
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         self._oom_retries = 0  # OOM auto-reduce counter for first epoch
@@ -444,7 +455,7 @@ class GTA_KD_Trainer(DetectionTrainer):
                 LOGGER.info(self.progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
-                        
+
             if self.teacher is not None:
                 distillation_loss.register_hook()
 
@@ -486,20 +497,18 @@ class GTA_KD_Trainer(DetectionTrainer):
                     if self.teacher is not None:
                         if self.cos_d_loss:
                             distill_weight = ((1 - math.cos(i * math.pi / len(self.train_loader))) / 2) * (0.1 - 1) + 1
-                        else: 
+                        else:
                             ratio = 1 - (i / len(self.train_loader))
-                            distill_weight = (0.1 + 0.9 * ratio)
+                            distill_weight = 0.1 + 0.9 * ratio
                         with torch.no_grad():
-                            pred = self.teacher(batch['img'])
-                            
+                            pred = self.teacher(batch["img"])
+
                         self.d_loss = distillation_loss.get_loss(batch, pred)
                         self.d_loss *= distill_weight
                         self.loss += self.d_loss
                         self.loss_items = torch.cat((self.loss_items, self.d_loss.detach().view(1)))
-                    
-                    self.tloss = (
-                        self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
-                    )
+
+                    self.tloss = self.loss_items if self.tloss is None else (self.tloss * i + self.loss_items) / (i + 1)
                     # Backward
                     self.scaler.scale(self.loss).backward()
                 except torch.cuda.OutOfMemoryError:
@@ -557,13 +566,13 @@ class GTA_KD_Trainer(DetectionTrainer):
             else:
                 # for/else: this block runs only when the for loop completes without break (no OOM retry)
                 self._oom_retries = 0  # reset OOM counter after successful first epoch
-            
+
             if self._oom_retries and not self.stop:
                 continue  # OOM recovery broke the for loop, restart with reduced batch size
 
             if hasattr(unwrap_model(self.model).criterion, "update"):
                 unwrap_model(self.model).criterion.update()
-                
+
             # More distillation logic
             if self.teacher is not None:
                 distillation_loss.remove_handle_()
@@ -629,7 +638,7 @@ class GTA_KD_Trainer(DetectionTrainer):
             self.run_callbacks("on_train_end")
         self._clear_memory()
         unset_deterministic()
-                
+
         # Distill logic
         if self.teacher is not None:
             distillation_loss.remove_handle_()
@@ -680,10 +689,10 @@ class GTA_KD_Trainer(DetectionTrainer):
                     g[0][fullname] = param
         if not use_muon:
             g = [list(x.values()) for x in g[:3]]  # convert to list of params
-        
+
         if teacher is not None:
             for i, v in enumerate(teacher.modules()):
-                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
                     if isinstance(g[2], list):
                         g[2].append(v.bias)
                     else:
@@ -693,7 +702,7 @@ class GTA_KD_Trainer(DetectionTrainer):
                         g[1].append(v.weight)
                     else:
                         g[1][f"teacher.{i}.weight"] = v.weight
-                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
+                elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):  # weight (with decay)
                     if isinstance(g[0], list):
                         g[0].append(v.weight)
                     else:
