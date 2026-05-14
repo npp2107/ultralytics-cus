@@ -17,5 +17,4 @@ py-cpuinfo
 pandas>=1.1.4
 seaborn>=0.11.0
 albumentations
-tensorboard
 # ultralytics-thop>=2.0.0

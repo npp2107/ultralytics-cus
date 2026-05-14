@@ -9,117 +9,42 @@ Usage:
 from __future__ import annotations
 
 import math
-import os
-import subprocess
 import time
 import warnings
 from copy import copy
-from datetime import timedelta
-from functools import partial
 
 import numpy as np
 import torch
 from torch import distributed as dist
-from torch import nn, optim
+from torch import nn
 
-from ultralytics.cfg import get_cfg, get_save_dir
-from ultralytics.optim import MuSGD
 from ultralytics.utils import (
     DEFAULT_CFG,
-    LOCAL_RANK,
     LOGGER,
     RANK,
     TQDM,
-    YAML,
     callbacks,
     colorstr,
 )
-from ultralytics.utils.checks import check_amp, check_file, check_imgsz, check_model_file_from_stem, print_args
-from ultralytics.utils.dist import ddp_cleanup, generate_ddp_command
+from ultralytics.utils.checks import check_amp, check_imgsz
 from ultralytics.utils.torch_utils import (
     TORCH_2_4,
     EarlyStopping,
     ModelEMA,
     attempt_compile,
     autocast,
-    init_seeds,
-    one_cycle,
-    select_device,
-    torch_distributed_zero_first,
     unset_deterministic,
     unwrap_model,
 )
 from ultralytics.utils.kd_loss import DistillationLoss
 from ultralytics.models import yolo
-from ultralytics.models.yolo.detect import DetectionTrainer
+from .train import DetectionTrainer
 
 class KD_Trainer(DetectionTrainer):
-    """A base class for creating trainers.
-
-    This class provides the foundation for training YOLO models, handling the training loop, validation, checkpointing,
-    and various training utilities. It supports both single-GPU and multi-GPU distributed training.
-
-    Attributes:
-        args (SimpleNamespace): Configuration for the trainer.
-        validator (BaseValidator): Validator instance.
-        model (nn.Module): Model instance.
-        callbacks (defaultdict): Dictionary of callbacks.
-        save_dir (Path): Directory to save results.
-        wdir (Path): Directory to save weights.
-        last (Path): Path to the last checkpoint.
-        best (Path): Path to the best checkpoint.
-        save_period (int): Save checkpoint every x epochs (disabled if < 1).
-        batch_size (int): Batch size for training.
-        epochs (int): Number of epochs to train for.
-        start_epoch (int): Starting epoch for training.
-        device (torch.device): Device to use for training.
-        amp (bool): Flag to enable AMP (Automatic Mixed Precision).
-        scaler (torch.amp.GradScaler): Gradient scaler for AMP.
-        data (dict): Dataset dictionary containing paths and metadata.
-        ema (ModelEMA): EMA (Exponential Moving Average) of the model.
-        resume (bool): Resume training from a checkpoint.
-        lf (callable): Learning rate scheduling function.
-        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
-        best_fitness (float): The best fitness value achieved.
-        fitness (float): Current fitness value.
-        loss (torch.Tensor): Current loss value.
-        tloss (torch.Tensor): Running mean of loss items.
-        loss_names (list): List of loss names.
-        csv (Path): Path to results CSV file.
-        metrics (dict): Dictionary of metrics.
-        plots (dict): Dictionary of plots.
-
-    Methods:
-        train: Execute the training process.
-        validate: Run validation on the val set.
-        save_model: Save model training checkpoints.
-        get_dataset: Get train and validation datasets.
-        setup_model: Load, create, or download model.
-        build_optimizer: Construct an optimizer for the model.
-
-    Examples:
-        Initialize a trainer and start training
-        >>> trainer = BaseTrainer(cfg="config.yaml")
-        >>> trainer.train()
-    """
-
+    """A class extending the DetectionTrainer class for training Knowledge Distillation (KD)."""
+    
     def __init__(self, cfg=DEFAULT_CFG, overrides=None, _callbacks: dict | None = None):
-        """Initialize the BaseTrainer class.
-
-        Args:
-            cfg (str | dict | SimpleNamespace, optional): Path to a configuration file or configuration object.
-            overrides (dict, optional): Configuration overrides.
-            _callbacks (dict, optional): Dictionary of callback functions.
-        """
-        self.hub_session = overrides.pop("session", None)  # HUB
-        self.args = get_cfg(cfg, overrides)
-        self.check_resume(overrides)
-        self.device = select_device(self.args.device)
-        # Update "-1" devices so post-training val does not repeat search
-        self.args.device = os.getenv("CUDA_VISIBLE_DEVICES") if "cuda" in str(self.device) else str(self.device)
-        self.validator = None
-        self.metrics = None
-        self.plots = {}
+        super().__init__(cfg, overrides, _callbacks)
         self.distill_loss_weight = overrides.get("distill_loss_weight", 0.3)
         self.cos_d_loss = overrides.get("cos_d_loss", True)
         self.s_layers = overrides.get("s_layers", ["6", "8", "13", "16", "19", "22"])
@@ -136,178 +61,14 @@ class KD_Trainer(DetectionTrainer):
             self.loss_type = None
             self.teacher = None
 
-        init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
-
-        # Dirs
-        self.save_dir = get_save_dir(self.args)
-        self.args.name = self.save_dir.name  # update name for loggers
-        self.wdir = self.save_dir / "weights"  # weights dir
-        if RANK in {-1, 0}:
-            self.wdir.mkdir(parents=True, exist_ok=True)  # make dir
-            self.args.save_dir = str(self.save_dir)
-            # Save run args, serializing augmentations as reprs for resume compatibility
-            args_dict = vars(self.args).copy()
-            if args_dict.get("augmentations") is not None:
-                # Serialize Albumentations transforms as their repr strings for checkpoint compatibility
-                args_dict["augmentations"] = [repr(t) for t in args_dict["augmentations"]]
-            YAML.save(self.save_dir / "args.yaml", args_dict)  # save run args
-        self.last, self.best = self.wdir / "last.pt", self.wdir / "best.pt"  # checkpoint paths
-        self.save_period = self.args.save_period
-
-        self.batch_size = self.args.batch
-        self.epochs = self.args.epochs or 100  # in case users accidentally pass epochs=None with timed training
-        self.start_epoch = 0
-        if RANK == -1:
-            print_args(vars(self.args))
-
-        # Device
-        if self.device.type in {"cpu", "mps"}:
-            self.args.workers = 0  # faster CPU training as time dominated by inference, not dataloading
-
-        # Callbacks - initialize early so on_pretrain_routine_start can capture original args.data
-        self.callbacks = _callbacks or callbacks.get_default_callbacks()
-
-        if isinstance(self.args.device, str) and len(self.args.device):  # i.e. device='0' or device='0,1,2,3'
-            world_size = len(self.args.device.split(","))
-        elif isinstance(self.args.device, (tuple, list)):  # i.e. device=[0, 1, 2, 3] (multi-GPU from CLI is list)
-            world_size = len(self.args.device)
-        elif self.args.device in {"cpu", "mps"}:  # i.e. device='cpu' or 'mps'
-            world_size = 0
-        elif torch.cuda.is_available():  # i.e. device=None or device='' or device=number
-            world_size = 1  # default to device 0
-        else:  # i.e. device=None or device=''
-            world_size = 0
-
-        self.ddp = world_size > 1 and "LOCAL_RANK" not in os.environ
-        self.world_size = world_size
-        # Run on_pretrain_routine_start before get_dataset() to capture original args.data (e.g., ul:// URIs)
-        if RANK in {-1, 0} and not self.ddp:
-            callbacks.add_integration_callbacks(self)
-            self.run_callbacks("on_pretrain_routine_start")
-
-        # Model and Dataset
-        # self.model = check_model_file_from_stem(self.args.model)
-        self.model = self.args.model
-        if hasattr(self.model, 'model') and not isinstance(self.model, torch.nn.Module):
-            self.model = self.model.model  # extract nn.Module from YOLO wrapper
-        if isinstance(self.model, str):
-            self.model = check_model_file_from_stem(self.model)  # add suffix, i.e. yolo26n -> yolo26n.pt
-        with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
-            self.data = self.get_dataset()
-
-        self.ema = None
-
-        # Optimization utils init
-        self.lf = None
-        self.scheduler = None
-
-        # Epoch level metrics
-        self.best_fitness = None
-        self.fitness = None
-        self.loss = None
-        self.tloss = None
-        self.loss_names = ["Loss"]
-        self.csv = self.save_dir / "results.csv"
-        if self.csv.exists() and not self.args.resume:
-            self.csv.unlink()
-        self.plot_idx = [0, 1, 2]
-        self.nan_recovery_attempts = 0
-
-    def add_callback(self, event: str, callback):
-        """Append the given callback to the event's callback list."""
-        self.callbacks[event].append(callback)
-
-    def set_callback(self, event: str, callback):
-        """Override the existing callbacks with the given callback for the specified event."""
-        self.callbacks[event] = [callback]
-
-    def run_callbacks(self, event: str):
-        """Run all existing callbacks associated with a particular event."""
-        for callback in self.callbacks.get(event, []):
-            callback(self)
-            
     def get_validator(self):
         """Return a DetectionValidator for YOLO model validation."""
         self.loss_names = "box_loss", "cls_loss", "dfl_loss"
         if self.teacher is not None:
             self.loss_names += ("kd_loss",)
-        return yolo.detect.DetectionValidator(
+        return yolo.detect.KD_DetectionValidator(
             self.test_loader, save_dir=self.save_dir, args=copy(self.args), _callbacks=self.callbacks
         )
-
-    def train(self):
-        """Execute the training process, using DDP subprocess for multi-GPU or direct training for single-GPU."""
-        # Run subprocess if DDP training, else train normally
-        if self.ddp:
-            # Argument checks
-            if self.args.rect:
-                LOGGER.warning("'rect=True' is incompatible with Multi-GPU training, setting 'rect=False'")
-                self.args.rect = False
-            if self.args.batch < 1.0:
-                raise ValueError(
-                    "AutoBatch with batch<1 not supported for Multi-GPU training, "
-                    f"please specify a valid batch size multiple of GPU count {self.world_size}, i.e. batch={self.world_size * 8}."
-                )
-
-            # Command
-            cmd, file = generate_ddp_command(self)
-            try:
-                LOGGER.info(f"{colorstr('DDP:')} debug command {' '.join(cmd)}")
-                subprocess.run(cmd, check=True)
-            except Exception as e:
-                raise e
-            finally:
-                ddp_cleanup(self, str(file))
-
-        else:
-            self._do_train()
-
-    def _setup_scheduler(self):
-        """Initialize training learning rate scheduler."""
-        if self.args.cos_lr:
-            self.lf = one_cycle(1, self.args.lrf, self.epochs)  # cosine 1->hyp['lrf']
-        else:
-            self.lf = lambda x: max(1 - x / self.epochs, 0) * (1.0 - self.args.lrf) + self.args.lrf  # linear
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=self.lf)
-
-    def _setup_ddp(self):
-        """Initialize and set the DistributedDataParallel parameters for training."""
-        torch.cuda.set_device(RANK)
-        self.device = torch.device("cuda", RANK)
-        os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # set to enforce timeout
-        dist.init_process_group(
-            backend="nccl" if dist.is_nccl_available() else "gloo",
-            timeout=timedelta(seconds=10800),  # 3 hours
-            rank=RANK,
-            world_size=self.world_size,
-        )
-
-    def _build_train_pipeline(self):
-        """Build dataloaders, optimizer, and scheduler for current batch size."""
-        batch_size = self.batch_size // max(self.world_size, 1)
-        self.train_loader = self.get_dataloader(
-            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
-        )
-        # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
-        self.test_loader = self.get_dataloader(
-            self.data.get("val") or self.data.get("test"),
-            batch_size=batch_size if self.args.task == "obb" else batch_size * 2,
-            rank=LOCAL_RANK,
-            mode="val",
-        )
-        self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
-        weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
-        iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
-        self.optimizer = self.build_optimizer(
-            model=self.model,
-            teacher=self.teacher,
-            name=self.args.optimizer,
-            lr=self.args.lr0,
-            momentum=self.args.momentum,
-            decay=weight_decay,
-            iterations=iterations,
-        )
-        self._setup_scheduler()
 
     def _setup_train(self):
         """Configure model, optimizer, dataloaders, and training utilities before the training loop."""
@@ -633,107 +394,3 @@ class KD_Trainer(DetectionTrainer):
             distillation_loss.remove_handle_()
 
         self.run_callbacks("teardown")
-
-    def build_optimizer(self, model, teacher=None, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
-        """Construct an optimizer for the given model.
-
-        Args:
-            model (torch.nn.Module): The model for which to build an optimizer.
-            teacher (torch.nn.Module): the teacher model that will help the model to improve.
-            name (str, optional): The name of the optimizer to use. If 'auto', the optimizer is selected based on the
-                number of iterations.
-            lr (float, optional): The learning rate for the optimizer.
-            momentum (float, optional): The momentum factor for the optimizer.
-            decay (float, optional): The weight decay for the optimizer.
-            iterations (float, optional): The number of iterations, which determines the optimizer if name is 'auto'.
-
-        Returns:
-            (torch.optim.Optimizer): The constructed optimizer.
-        """
-        g = [{}, {}, {}, {}]  # optimizer parameter groups
-        bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
-        if name == "auto":
-            LOGGER.info(
-                f"{colorstr('optimizer:')} 'optimizer=auto' found, "
-                f"ignoring 'lr0={self.args.lr0}' and 'momentum={self.args.momentum}' and "
-                f"determining best 'optimizer', 'lr0' and 'momentum' automatically... "
-            )
-            nc = self.data.get("nc", 10)  # number of classes
-            lr_fit = round(0.002 * 5 / (4 + nc), 6)  # lr0 fit equation to 6 decimal places
-            name, lr, momentum = ("MuSGD", 0.01, 0.9) if iterations > 10000 else ("AdamW", lr_fit, 0.9)
-            self.args.warmup_bias_lr = 0.0  # no higher than 0.01 for Adam
-
-        use_muon = name == "MuSGD"
-        for module_name, module in unwrap_model(model).named_modules():
-            for param_name, param in module.named_parameters(recurse=False):
-                fullname = f"{module_name}.{param_name}" if module_name else param_name
-                if param.ndim >= 2 and use_muon:
-                    g[3][fullname] = param  # muon params
-                elif "bias" in fullname:  # bias (no decay)
-                    g[2][fullname] = param
-                elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
-                    # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
-                    g[1][fullname] = param
-                else:  # weight (with decay)
-                    g[0][fullname] = param
-        if not use_muon:
-            g = [list(x.values()) for x in g[:3]]  # convert to list of params
-        
-        if teacher is not None:
-            for i, v in enumerate(teacher.modules()):
-                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
-                    if isinstance(g[2], list):
-                        g[2].append(v.bias)
-                    else:
-                        g[2][f"teacher.{i}.bias"] = v.bias
-                if isinstance(v, bn):  # weight (no decay)
-                    if isinstance(g[1], list):
-                        g[1].append(v.weight)
-                    else:
-                        g[1][f"teacher.{i}.weight"] = v.weight
-                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
-                    if isinstance(g[0], list):
-                        g[0].append(v.weight)
-                    else:
-                        g[0][f"teacher.{i}.weight"] = v.weight
-
-        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "MuSGD", "auto"}
-        name = {x.lower(): x for x in optimizers}.get(name.lower())
-        if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
-            optim_args = dict(lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
-        elif name == "RMSProp":
-            optim_args = dict(lr=lr, momentum=momentum)
-        elif name == "SGD" or name == "MuSGD":
-            optim_args = dict(lr=lr, momentum=momentum, nesterov=True)
-        else:
-            raise NotImplementedError(
-                f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
-                "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
-            )
-
-        num_params = [len(g[0]), len(g[1]), len(g[2])]  # number of param groups
-        g[2] = {"params": g[2], **optim_args, "param_group": "bias"}
-        g[0] = {"params": g[0], **optim_args, "weight_decay": decay, "param_group": "weight"}
-        g[1] = {"params": g[1], **optim_args, "weight_decay": 0.0, "param_group": "bn"}
-        muon, sgd = (0.2, 1.0)
-        if use_muon:
-            num_params[0] = len(g[3])  # update number of params
-            g[3] = {"params": g[3], **optim_args, "weight_decay": decay, "use_muon": True, "param_group": "muon"}
-            import re
-
-            # higher lr for certain parameters in MuSGD when funetuning
-            pattern = re.compile(r"(?=.*23)(?=.*cv3)|proto\.semseg")
-            g_ = []  # new param groups
-            for x in g:
-                p = x.pop("params")
-                p1 = [v for k, v in p.items() if pattern.search(k)]
-                p2 = [v for k, v in p.items() if not pattern.search(k)]
-                g_.extend([{"params": p1, **x, "lr": lr * 3}, {"params": p2, **x}])
-            g = g_
-        optimizer = getattr(optim, name, partial(MuSGD, muon=muon, sgd=sgd))(params=g)
-
-        LOGGER.info(
-            f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}, momentum={momentum}) with parameter groups "
-            f"{num_params[1]} weight(decay=0.0), {num_params[0]} weight(decay={decay}), {num_params[2]} bias(decay=0.0)"
-        )
-        return optimizer

@@ -61,6 +61,7 @@ classifiers = [
 
 # Required dependencies ------------------------------------------------------------------------------------------------
 dependencies = [
+    "tensorboard",
     "numpy>=1.23.0",
     "matplotlib>=3.3.0",
     "opencv-python>=4.6.0",
