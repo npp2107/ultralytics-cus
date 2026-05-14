@@ -43,8 +43,8 @@ teacher: None
 distillation_loss: None # (str, optional) distillation loss type, e.g. 'cwd' or 'mgd'
 distill_loss_weight: 0.3
 cos_d_loss: True
-s_layers: ["6", "8", "13", "16", "19", "22"]
-t_layers: ["6", "8", "13", "16", "19", "22"]
+s_layers: None
+t_layers: None
 class_mapping: None
 teacher_pred_conf: 0.01
 
