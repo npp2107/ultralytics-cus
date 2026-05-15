@@ -329,6 +329,8 @@ class ConfusionMatrix(DataExportMixin):
         self.matrix = np.zeros((self.nc, self.nc)) if self.task == "classify" else np.zeros((self.nc + 1, self.nc + 1))
         self.names = names  # name of classes
         self.matches = {} if save_matches else None
+        self._conf = 0.25  # effective confidence threshold (updated in process_batch)
+        self._iou_thres = 0.45  # effective IoU threshold (updated in process_batch)
 
     def _append_matches(self, mtype: str, batch: dict[str, Any], idx: int) -> None:
         """Append the matches to TP, FP, FN or GT list for the last batch.
@@ -391,6 +393,8 @@ class ConfusionMatrix(DataExportMixin):
                 self._append_matches("GT", batch, i)  # store GT
         is_obb = gt_bboxes.shape[1] == 5  # check if boxes contains angle for OBB
         conf = 0.25 if conf in {None, 0.01 if is_obb else 0.001} else conf  # apply 0.25 if default val conf is passed
+        self._conf = conf  # store effective conf for use in plot filename
+        self._iou_thres = iou_thres  # store effective iou_thres for use in plot filename
         no_pred = detections["cls"].shape[0] == 0
         if gt_cls.shape[0] == 0:  # Check if labels is empty
             if not no_pred:
@@ -609,7 +613,8 @@ class ConfusionMatrix(DataExportMixin):
                 ax.spines[s].set_visible(False)  # Confusion matrix plot don't have outline
             cbar.ax.spines[s].set_visible(False)
         fig.subplots_adjust(left=0, right=0.84, top=0.94, bottom=btm)  # Adjust layout to ensure equal margins
-        plot_fname = Path(save_dir) / f"{title.lower().replace(' ', '_')}.png"
+        conf_str = f"conf{self._conf:.2f}_iou{self._iou_thres:.2f}"
+        plot_fname = Path(save_dir) / f"{title.lower().replace(' ', '_')}_{conf_str}.png"
         fig.savefig(plot_fname, dpi=250)
         plt.close(fig)
         if on_plot:
